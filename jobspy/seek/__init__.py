@@ -40,6 +40,7 @@ class Seek(Scraper):
         user_agent: str | None = None,
     ):
         super().__init__(Site.SEEK, proxies=proxies, ca_cert=ca_cert)
+        # Session with proxy for API search requests
         self.session = create_session(
             proxies=self.proxies,
             ca_cert=ca_cert,
@@ -49,6 +50,14 @@ class Seek(Scraper):
             clear_cookies=True,
         )
         self.session.headers.update(headers)
+        # Separate session without proxy for detail pages (proxy causes SSL errors)
+        self.detail_session = create_session(
+            is_tls=False,
+            has_retry=True,
+            delay=5,
+            clear_cookies=True,
+        )
+        self.detail_session.headers.update(headers)
         self.scraper_input = None
         self.base_url = None
         self.site_key = None
@@ -196,7 +205,7 @@ class Seek(Scraper):
 
         # Salary
         salary_label = job_data.get("salaryLabel")
-        compensation = parse_salary(salary_label)
+        compensation = parse_salary(salary_label, country=self.country)
 
         # Job type
         work_types = job_data.get("workTypes") or []
@@ -240,7 +249,7 @@ class Seek(Scraper):
         url = f"{self.base_url}/job/{job_id}"
         try:
             time.sleep(random.uniform(1, 2))
-            resp = self.session.get(url, timeout=30)
+            resp = self.detail_session.get(url, timeout=30)
             if resp.status_code != 200:
                 log.debug(f"Could not fetch description for job {job_id}: HTTP {resp.status_code}")
                 return None

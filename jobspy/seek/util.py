@@ -30,7 +30,7 @@ def parse_date(date_str: str) -> Optional[datetime]:
         return None
 
 
-def parse_salary(salary_label: str) -> Optional[Compensation]:
+def parse_salary(salary_label: str, country: Country = None) -> Optional[Compensation]:
     """Parse Seek salary label like '$80,000 - $100,000 per year' into Compensation."""
     if not salary_label:
         return None
@@ -48,10 +48,12 @@ def parse_salary(salary_label: str) -> Optional[Compensation]:
     elif "per week" in text or "weekly" in text:
         interval = CompensationInterval.WEEKLY
 
-    # Determine currency
-    currency = "AUD"
+    # Determine currency: explicit in text > country-based default
+    currency = "NZD" if country == Country.NEWZEALAND else "AUD"
     if "nz$" in text or "nzd" in text:
         currency = "NZD"
+    elif "a$" in text or "aud" in text:
+        currency = "AUD"
 
     # Extract numbers
     import re

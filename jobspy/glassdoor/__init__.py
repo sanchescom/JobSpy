@@ -329,7 +329,7 @@ class Glassdoor(Scraper):
         if fromage:
             filter_params.append({"filterKey": "fromAge", "values": str(fromage)})
         if employer_id:
-            filter_params.append({"filterKey": "employer", "values": str(employer_id)})
+            filter_params.append({"filterKey": "companyId", "values": str(employer_id)})
         payload = {
             "operationName": "JobSearchResultsQuery",
             "variables": {

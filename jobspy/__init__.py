@@ -47,6 +47,7 @@ def scrape_jobs(
     description_format: str = "markdown",
     linkedin_fetch_description: bool | None = False,
     linkedin_company_ids: list[int] | None = None,
+    company_name: str | None = None,
     offset: int | None = 0,
     hours_old: int = None,
     enforce_annual_salary: bool = False,
@@ -103,6 +104,7 @@ def scrape_jobs(
         linkedin_fetch_description=linkedin_fetch_description,
         results_wanted=results_wanted,
         linkedin_company_ids=linkedin_company_ids,
+        company_name=company_name,
         offset=offset,
         hours_old=hours_old,
     )

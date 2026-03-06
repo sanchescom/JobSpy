@@ -77,6 +77,28 @@ class Glassdoor(Scraper):
             return JobResponse(jobs=[])
         job_list: list[JobPost] = []
         cursor = None
+        employer_id = None
+
+        # Phase 1: if company_name is set, do a discovery fetch to find employer ID
+        if scraper_input.company_name:
+            try:
+                _, _, company_options = self._fetch_jobs_page(
+                    scraper_input, location_id, location_type, 1, None
+                )
+                company_lower = scraper_input.company_name.lower()
+                for opt in company_options:
+                    if company_lower in opt.get("shortName", "").lower():
+                        employer_id = opt["id"]
+                        log.info(f"Glassdoor: matched company '{scraper_input.company_name}' → ID {employer_id} ({opt['shortName']})")
+                        break
+                if not employer_id:
+                    available = [opt.get("shortName", "?") for opt in company_options[:10]]
+                    log.warning(f"Glassdoor: company '{scraper_input.company_name}' not found in filter options: {available}")
+            except Exception as e:
+                log.error(f"Glassdoor company discovery failed: {str(e)}")
+
+            # Reset state for phase 2
+            self.seen_urls.clear()
 
         range_start = 1 + (scraper_input.offset // self.jobs_per_page)
         tot_pages = (scraper_input.results_wanted // self.jobs_per_page) + 2
@@ -84,8 +106,9 @@ class Glassdoor(Scraper):
         for page in range(range_start, range_end):
             log.info(f"search page: {page} / {range_end - 1}")
             try:
-                jobs, cursor = self._fetch_jobs_page(
-                    scraper_input, location_id, location_type, page, cursor
+                jobs, cursor, _ = self._fetch_jobs_page(
+                    scraper_input, location_id, location_type, page, cursor,
+                    employer_id=employer_id,
                 )
                 job_list.extend(jobs)
                 if not jobs or len(job_list) >= scraper_input.results_wanted:
@@ -103,14 +126,16 @@ class Glassdoor(Scraper):
         location_type: str,
         page_num: int,
         cursor: str | None,
-    ) -> Tuple[list[JobPost], str | None]:
+        employer_id: int | None = None,
+    ) -> Tuple[list[JobPost], str | None, list[dict]]:
         """
-        Scrapes a page of Glassdoor for jobs with scraper_input criteria
+        Scrapes a page of Glassdoor for jobs with scraper_input criteria.
+        Returns (jobs, next_cursor, company_filter_options).
         """
         jobs = []
         self.scraper_input = scraper_input
         try:
-            payload = self._add_payload(location_id, location_type, page_num, cursor)
+            payload = self._add_payload(location_id, location_type, page_num, cursor, employer_id=employer_id)
             response = self.session.post(
                 f"{self.base_url}/graph",
                 timeout_seconds=15,
@@ -129,9 +154,11 @@ class Glassdoor(Scraper):
             Exception,
         ) as e:
             log.error(f"Glassdoor: {str(e)}")
-            return jobs, None
+            return jobs, None, []
 
-        jobs_data = res_json["data"]["jobListings"]["jobListings"]
+        listings = res_json["data"]["jobListings"]
+        jobs_data = listings["jobListings"]
+        company_filter_options = listings.get("companyFilterOptions", [])
 
         with ThreadPoolExecutor(max_workers=self.jobs_per_page) as executor:
             future_to_job_data = {
@@ -146,8 +173,8 @@ class Glassdoor(Scraper):
                     raise GlassdoorException(f"Glassdoor generated an exception: {exc}")
 
         return jobs, get_cursor_for_page(
-            res_json["data"]["jobListings"]["paginationCursors"], page_num + 1
-        )
+            listings["paginationCursors"], page_num + 1
+        ), company_filter_options
 
     def _get_csrf_token(self):
         """
@@ -289,6 +316,7 @@ class Glassdoor(Scraper):
         location_type: str,
         page_num: int,
         cursor: str | None = None,
+        employer_id: int | None = None,
     ) -> str:
         fromage = None
         if self.scraper_input.hours_old:
@@ -298,6 +326,8 @@ class Glassdoor(Scraper):
             filter_params.append({"filterKey": "applicationType", "values": "1"})
         if fromage:
             filter_params.append({"filterKey": "fromAge", "values": str(fromage)})
+        if employer_id:
+            filter_params.append({"filterKey": "employer", "values": str(employer_id)})
         payload = {
             "operationName": "JobSearchResultsQuery",
             "variables": {

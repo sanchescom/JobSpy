@@ -317,6 +317,7 @@ class ScraperInput(BaseModel):
     offset: int = 0
     linkedin_fetch_description: bool = False
     linkedin_company_ids: list[int] | None = None
+    company_name: str | None = None
     description_format: DescriptionFormat | None = DescriptionFormat.MARKDOWN
 
     request_timeout: int = 60

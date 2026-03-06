@@ -295,6 +295,7 @@ class Site(Enum):
     BDJOBS = "bdjobs"  # Add this line
     SEEK = "seek"
     REED = "reed"
+    IRISH_JOBS = "irish_jobs"
 
 
 class SalarySource(Enum):

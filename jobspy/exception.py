@@ -53,3 +53,8 @@ class SeekException(Exception):
 class ReedException(Exception):
     def __init__(self, message=None):
         super().__init__(message or "An error occurred with Reed")
+
+
+class IrishJobsException(Exception):
+    def __init__(self, message=None):
+        super().__init__(message or "An error occurred with IrishJobs")

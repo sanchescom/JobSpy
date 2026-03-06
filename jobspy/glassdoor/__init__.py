@@ -85,6 +85,7 @@ class Glassdoor(Scraper):
                 _, _, company_options = self._fetch_jobs_page(
                     scraper_input, location_id, location_type, 1, None
                 )
+                log.info(f"Glassdoor: discovery returned {len(company_options)} company filter options")
                 company_lower = scraper_input.company_name.lower()
                 for opt in company_options:
                     short = opt.get("shortName") or ""

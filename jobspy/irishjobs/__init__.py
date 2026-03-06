@@ -438,14 +438,17 @@ class IrishJobs(Scraper):
             from jobspy.util import extract_job_type
             job_types = extract_job_type(description)
 
-        job_url = job_data.get("url", "")
+        raw_url = job_data.get("url", "")
 
         # Extract job ID from URL: /...-job106721422 -> ij-106721422
-        id_match = re.search(r"job(\d+)", job_url)
+        id_match = re.search(r"job(\d+)", raw_url)
         if id_match:
             job_id = f"ij-{id_match.group(1)}"
+            # Use /jobs/<id> format — direct /job/... links are blocked by Akamai CDN
+            job_url = f"{SEARCH_URL}/{id_match.group(1)}"
         else:
-            job_id = f"ij-{abs(hash(job_url))}"
+            job_id = f"ij-{abs(hash(raw_url))}"
+            job_url = raw_url
 
         # Convert HTML description to markdown if needed
         if description and self.scraper_input and self.scraper_input.description_format:

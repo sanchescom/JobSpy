@@ -48,3 +48,8 @@ class BDJobsException(Exception):
 class SeekException(Exception):
     def __init__(self, message=None):
         super().__init__(message or "An error occurred with Seek")
+
+
+class ReedException(Exception):
+    def __init__(self, message=None):
+        super().__init__(message or "An error occurred with Reed")

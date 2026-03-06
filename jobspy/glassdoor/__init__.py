@@ -87,12 +87,13 @@ class Glassdoor(Scraper):
                 )
                 company_lower = scraper_input.company_name.lower()
                 for opt in company_options:
-                    if company_lower in opt.get("shortName", "").lower():
+                    short = opt.get("shortName") or ""
+                    if company_lower in short.lower():
                         employer_id = opt["id"]
-                        log.info(f"Glassdoor: matched company '{scraper_input.company_name}' → ID {employer_id} ({opt['shortName']})")
+                        log.info(f"Glassdoor: matched company '{scraper_input.company_name}' → ID {employer_id} ({short})")
                         break
                 if not employer_id:
-                    available = [opt.get("shortName", "?") for opt in company_options[:10]]
+                    available = [opt.get("shortName") or "?" for opt in company_options[:10]]
                     log.warning(f"Glassdoor: company '{scraper_input.company_name}' not found in filter options: {available}")
             except Exception as e:
                 log.error(f"Glassdoor company discovery failed: {str(e)}")

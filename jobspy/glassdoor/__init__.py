@@ -215,10 +215,18 @@ class Glassdoor(Scraper):
             location = parse_location(location_name)
 
         compensation = parse_compensation(job["header"])
-        try:
-            description = self._fetch_job_description(job_id)
-        except:
-            description = None
+
+        # Use description from the initial search response (already fetched).
+        # Falls back to a separate API call only if missing.
+        description = job["job"].get("description")
+        if description and self.scraper_input.description_format == DescriptionFormat.MARKDOWN:
+            description = markdown_converter(description)
+        if not description:
+            try:
+                description = self._fetch_job_description(job_id)
+            except Exception as e:
+                log.warning(f"Failed to fetch description for job {job_id}: {e}")
+                description = None
         company_url = f"{self.base_url}Overview/W-EI_IE{company_id}.htm"
         company_logo = (
             job_data["jobview"].get("overview", {}).get("squareLogoUrl", None)
@@ -274,8 +282,9 @@ class Glassdoor(Scraper):
                 """,
             }
         ]
-        res = requests.post(url, json=body, headers=headers)
+        res = self.session.post(url, json=body)
         if res.status_code != 200:
+            log.warning(f"Description fetch returned {res.status_code} for job {job_id}")
             return None
         data = res.json()[0]
         desc = data["data"]["jobview"]["job"]["description"]

@@ -225,6 +225,21 @@ class Seek(Scraper):
         # Remote check
         is_remote = self._check_remote(title, location_label, work_types)
 
+        # Build description from API data (teaser + bulletPoints).
+        # Full description requires fetching the detail page which is
+        # behind Cloudflare, so we use what the search API provides.
+        desc_parts = []
+        teaser = job_data.get("teaser")
+        if teaser:
+            desc_parts.append(teaser)
+        bullet_points = job_data.get("bulletPoints") or []
+        if bullet_points:
+            desc_parts.append("\n".join(f"- {bp}" for bp in bullet_points))
+        description = "\n\n".join(desc_parts) if desc_parts else None
+
+        # Try fetching full description from detail page
+        full_description = self._get_job_description(job_id)
+
         job_post = JobPost(
             id=job_id,
             title=title,
@@ -235,12 +250,8 @@ class Seek(Scraper):
             job_type=job_types or None,
             job_url=job_url,
             is_remote=is_remote,
+            description=full_description or description,
         )
-
-        # Fetch description
-        description = self._get_job_description(job_id)
-        if description:
-            job_post.description = description
 
         return job_post
 
@@ -254,12 +265,16 @@ class Seek(Scraper):
                 log.debug(f"Could not fetch description for job {job_id}: HTTP {resp.status_code}")
                 return None
 
+            # Check for Cloudflare challenge
+            if "Just a moment" in resp.text[:500]:
+                log.debug(f"Cloudflare challenge for job {job_id}, skipping detail fetch")
+                return None
+
             soup = BeautifulSoup(resp.text, "html.parser")
             desc_elem = soup.find(
                 "span", attrs={"data-automation": "jobAdDetails"}
             )
             if not desc_elem:
-                # Fallback: try div with same attribute
                 desc_elem = soup.find(
                     "div", attrs={"data-automation": "jobAdDetails"}
                 )

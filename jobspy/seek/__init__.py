@@ -50,8 +50,10 @@ class Seek(Scraper):
             clear_cookies=True,
         )
         self.session.headers.update(headers)
-        # Separate session without proxy for detail pages (proxy causes SSL errors)
+        # Use proxy for detail pages too (needed to bypass Cloudflare on datacenter IPs)
         self.detail_session = create_session(
+            proxies=self.proxies,
+            ca_cert=ca_cert,
             is_tls=False,
             has_retry=True,
             delay=5,

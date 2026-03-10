@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import random
+import re
 import time
 from typing import Optional
+from urllib.parse import urlparse, urlunparse
 
 from bs4 import BeautifulSoup
 
@@ -28,6 +30,29 @@ from jobspy.util import (
 
 log = create_logger("Seek")
 
+# Map Seek country to proxy geo-targeting suffix
+_COUNTRY_PROXY_GEO = {
+    "australia": "au",
+    "new zealand": "nz",
+}
+
+
+def _add_proxy_geo(proxy_url: str, country_code: str) -> str:
+    """Append _country-XX to proxy password for geo-targeting."""
+    if not proxy_url or not country_code:
+        return proxy_url
+    parsed = urlparse(proxy_url)
+    if not parsed.password:
+        return proxy_url
+    # Avoid appending twice
+    if f"_country-{country_code}" in parsed.password:
+        return proxy_url
+    new_password = f"{parsed.password}_country-{country_code}"
+    netloc = f"{parsed.username}:{new_password}@{parsed.hostname}"
+    if parsed.port:
+        netloc += f":{parsed.port}"
+    return urlunparse((parsed.scheme, netloc, parsed.path, "", "", ""))
+
 
 class Seek(Scraper):
     delay = 3
@@ -50,16 +75,6 @@ class Seek(Scraper):
             clear_cookies=True,
         )
         self.session.headers.update(headers)
-        # Use proxy for detail pages too (needed to bypass Cloudflare on datacenter IPs)
-        self.detail_session = create_session(
-            proxies=self.proxies,
-            ca_cert=ca_cert,
-            is_tls=False,
-            has_retry=True,
-            delay=5,
-            clear_cookies=True,
-        )
-        self.detail_session.headers.update(headers)
         self.scraper_input = None
         self.base_url = None
         self.site_key = None
@@ -121,6 +136,29 @@ class Seek(Scraper):
         self.locale = config["locale"]
         self.country = country or Country.AUSTRALIA
 
+    def _get_detail_session(self):
+        """Create a session for detail page fetches with geo-targeted proxy."""
+        country_str = "australia"
+        if self.country:
+            country_str = self.country.value[0].split(",")[0].lower()
+        geo_code = _COUNTRY_PROXY_GEO.get(country_str, "au")
+
+        proxy = self.proxies
+        if proxy:
+            if isinstance(proxy, list):
+                proxy = proxy[0]
+            proxy = _add_proxy_geo(proxy, geo_code)
+
+        session = create_session(
+            proxies=proxy,
+            is_tls=False,
+            has_retry=True,
+            delay=5,
+            clear_cookies=True,
+        )
+        session.headers.update(headers)
+        return session
+
     def _scrape_page(
         self, scraper_input: ScraperInput, page: int
     ) -> tuple[list[JobPost], int | None]:
@@ -167,10 +205,12 @@ class Seek(Scraper):
         job_data_list = data.get("data", [])
         total_count = data.get("totalCount")
 
+        detail_session = self._get_detail_session()
+
         jobs = []
         for item in job_data_list:
             try:
-                job = self._process_job(item)
+                job = self._process_job(item, detail_session)
                 if job:
                     jobs.append(job)
             except Exception as e:
@@ -182,7 +222,7 @@ class Seek(Scraper):
         )
         return jobs, total_count
 
-    def _process_job(self, job_data: dict) -> Optional[JobPost]:
+    def _process_job(self, job_data: dict, detail_session) -> Optional[JobPost]:
         """Convert a single Seek API job object to a JobPost."""
         job_id = str(job_data.get("id", ""))
         if not job_id:
@@ -227,9 +267,7 @@ class Seek(Scraper):
         # Remote check
         is_remote = self._check_remote(title, location_label, work_types)
 
-        # Build description from API data (teaser + bulletPoints).
-        # Full description requires fetching the detail page which is
-        # behind Cloudflare, so we use what the search API provides.
+        # Build fallback description from API data (teaser + bulletPoints)
         desc_parts = []
         teaser = job_data.get("teaser")
         if teaser:
@@ -237,10 +275,10 @@ class Seek(Scraper):
         bullet_points = job_data.get("bulletPoints") or []
         if bullet_points:
             desc_parts.append("\n".join(f"- {bp}" for bp in bullet_points))
-        description = "\n\n".join(desc_parts) if desc_parts else None
+        fallback_description = "\n\n".join(desc_parts) if desc_parts else None
 
-        # Try fetching full description from detail page
-        full_description = self._get_job_description(job_id)
+        # Fetch full description from detail page
+        full_description = self._get_job_description(job_id, detail_session)
 
         job_post = JobPost(
             id=job_id,
@@ -252,24 +290,24 @@ class Seek(Scraper):
             job_type=job_types or None,
             job_url=job_url,
             is_remote=is_remote,
-            description=full_description or description,
+            description=full_description or fallback_description,
         )
 
         return job_post
 
-    def _get_job_description(self, job_id: str) -> Optional[str]:
-        """Fetch job detail page and extract description HTML/markdown."""
+    def _get_job_description(self, job_id: str, detail_session) -> Optional[str]:
+        """Fetch job detail page and extract description."""
         url = f"{self.base_url}/job/{job_id}"
         try:
             time.sleep(random.uniform(1, 2))
-            resp = self.detail_session.get(url, timeout=30)
+            resp = detail_session.get(url, timeout=30)
             if resp.status_code != 200:
                 log.debug(f"Could not fetch description for job {job_id}: HTTP {resp.status_code}")
                 return None
 
             # Check for Cloudflare challenge
             if "Just a moment" in resp.text[:500]:
-                log.debug(f"Cloudflare challenge for job {job_id}, skipping detail fetch")
+                log.debug(f"Cloudflare challenge for job {job_id}")
                 return None
 
             soup = BeautifulSoup(resp.text, "html.parser")

@@ -9,6 +9,8 @@ from urllib.parse import urlparse, urlunparse
 
 from bs4 import BeautifulSoup
 
+from jobspy.google.proxy_relay import ProxyRelay
+
 from jobspy.exception import SeekException
 from jobspy.seek.constant import headers, SEEK_SITES, SEARCH_API_PATH
 from jobspy.seek.util import parse_location, parse_date, parse_salary, map_work_type
@@ -30,6 +32,29 @@ from jobspy.util import (
 )
 
 log = create_logger("Seek")
+
+# Map Seek country to proxy geo-targeting suffix
+_COUNTRY_PROXY_GEO = {
+    "australia": "au",
+    "new zealand": "nz",
+}
+
+
+def _add_proxy_geo(proxy_url: str, country_code: str) -> str:
+    """Append _country-XX to proxy password for geo-targeting."""
+    if not proxy_url or not country_code:
+        return proxy_url
+    parsed = urlparse(proxy_url)
+    if not parsed.password:
+        return proxy_url
+    if f"_country-{country_code}" in parsed.password:
+        return proxy_url
+    new_password = f"{parsed.password}_country-{country_code}"
+    netloc = f"{parsed.username}:{new_password}@{parsed.hostname}"
+    if parsed.port:
+        netloc += f":{parsed.port}"
+    return urlunparse((parsed.scheme, netloc, parsed.path, "", "", ""))
+
 
 _STEALTH_JS = """
 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
@@ -216,6 +241,17 @@ class Seek(Scraper):
         )
         return jobs, total_count
 
+    def _get_geo_proxy(self) -> str | None:
+        """Get geo-targeted proxy URL for the current country."""
+        if not self.proxies:
+            return None
+        proxy = self.proxies if isinstance(self.proxies, str) else self.proxies[0]
+        country_str = "australia"
+        if self.country:
+            country_str = self.country.value[0].split(",")[0].lower()
+        geo_code = _COUNTRY_PROXY_GEO.get(country_str, "au")
+        return _add_proxy_geo(proxy, geo_code)
+
     def _fetch_descriptions_playwright(self, job_ids: list[str]) -> dict[str, str]:
         """Fetch full descriptions for a batch of jobs using Playwright."""
         if not job_ids:
@@ -228,7 +264,16 @@ class Seek(Scraper):
             log.warning("Playwright not installed — skipping full descriptions")
             return descriptions
 
+        relay = None
         try:
+            # Set up proxy relay for geo-targeted residential proxy
+            geo_proxy = self._get_geo_proxy()
+            proxy_arg = None
+            if geo_proxy:
+                relay = ProxyRelay(upstream_proxy=geo_proxy)
+                relay.start()
+                proxy_arg = {"server": f"http://127.0.0.1:{relay.port}"}
+
             with sync_playwright() as p:
                 launch_kwargs = {
                     "headless": False,
@@ -239,6 +284,9 @@ class Seek(Scraper):
                         "--window-size=1920,1080",
                     ],
                 }
+                if proxy_arg:
+                    launch_kwargs["proxy"] = proxy_arg
+
                 browser = self._launch_browser(p, launch_kwargs)
                 try:
                     context = browser.new_context(
@@ -263,6 +311,9 @@ class Seek(Scraper):
                     browser.close()
         except Exception as e:
             log.warning(f"Playwright browser error: {e}")
+        finally:
+            if relay:
+                relay.stop()
 
         log.info(f"Playwright: fetched {len(descriptions)}/{len(job_ids)} descriptions")
         return descriptions

@@ -31,6 +31,25 @@ from jobspy.util import (
 
 log = create_logger("Seek")
 
+_STEALTH_JS = """
+Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+Object.defineProperty(navigator, 'plugins', {
+    get: () => [
+        { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+        { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '' },
+        { name: 'Native Client', filename: 'internal-nacl-plugin', description: '' },
+    ],
+});
+Object.defineProperty(navigator, 'languages', { get: () => ['en-AU', 'en'] });
+window.chrome = { runtime: {}, loadTimes: function(){}, csi: function(){} };
+const getParameter = WebGLRenderingContext.prototype.getParameter;
+WebGLRenderingContext.prototype.getParameter = function(parameter) {
+    if (parameter === 37445) return 'Intel Inc.';
+    if (parameter === 37446) return 'Intel Iris OpenGL Engine';
+    return getParameter.call(this, parameter);
+};
+"""
+
 
 class Seek(Scraper):
     delay = 3
@@ -212,11 +231,12 @@ class Seek(Scraper):
         try:
             with sync_playwright() as p:
                 launch_kwargs = {
-                    "headless": True,
+                    "headless": False,
                     "args": [
                         "--disable-blink-features=AutomationControlled",
                         "--no-sandbox",
                         "--disable-dev-shm-usage",
+                        "--window-size=1920,1080",
                     ],
                 }
                 browser = self._launch_browser(p, launch_kwargs)
@@ -225,8 +245,8 @@ class Seek(Scraper):
                         viewport={"width": 1920, "height": 1080},
                         locale="en-AU",
                         timezone_id="Australia/Sydney",
-                        user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
                     )
+                    context.add_init_script(_STEALTH_JS)
                     pw_page = context.new_page()
 
                     for job_id in job_ids:

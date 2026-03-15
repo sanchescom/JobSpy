@@ -135,7 +135,6 @@ class Google(Scraper):
                 context = browser.new_context(
                     viewport={"width": 1920, "height": 1080},
                     locale="en-US",
-                    timezone_id="America/New_York",
                 )
                 # Stealth JS removed — overriding navigator.webdriver via JS is
                 # itself detectable by Google. --disable-blink-features=AutomationControlled

@@ -24,50 +24,6 @@ from jobspy.google.util import log, find_job_info_initial_page, find_job_info
 from jobspy.google.constant import headers_jobs, async_param
 from jobspy.google.proxy_relay import ProxyRelay
 
-# JavaScript to inject before any page load to mask automation fingerprints
-_STEALTH_JS = """
-// Remove webdriver flag
-Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-
-// Fake plugins
-Object.defineProperty(navigator, 'plugins', {
-    get: () => [
-        { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
-        { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '' },
-        { name: 'Native Client', filename: 'internal-nacl-plugin', description: '' },
-    ],
-});
-
-// Fake languages
-Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-
-// Remove automation-related properties
-delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
-delete window.cdc_adoQpoasnfa76pfcZLmcfl_JSON;
-delete window.cdc_adoQpoasnfa76pfcZLmcfl_Object;
-delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
-delete window.cdc_adoQpoasnfa76pfcZLmcfl_Proxy;
-delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
-
-// Override permissions query
-const originalQuery = window.navigator.permissions.query;
-window.navigator.permissions.query = (parameters) =>
-    parameters.name === 'notifications'
-        ? Promise.resolve({ state: Notification.permission })
-        : originalQuery(parameters);
-
-// Chrome runtime
-window.chrome = { runtime: {}, loadTimes: function(){}, csi: function(){} };
-
-// WebGL vendor/renderer
-const getParameter = WebGLRenderingContext.prototype.getParameter;
-WebGLRenderingContext.prototype.getParameter = function(parameter) {
-    if (parameter === 37445) return 'Intel Inc.';
-    if (parameter === 37446) return 'Intel Iris OpenGL Engine';
-    return getParameter.call(this, parameter);
-};
-"""
-
 
 class Google(Scraper):
     def __init__(
@@ -181,8 +137,9 @@ class Google(Scraper):
                     locale="en-US",
                     timezone_id="America/New_York",
                 )
-                # Inject stealth script before every page load
-                context.add_init_script(_STEALTH_JS)
+                # Stealth JS removed — overriding navigator.webdriver via JS is
+                # itself detectable by Google. --disable-blink-features=AutomationControlled
+                # Chrome flag is sufficient.
                 page = context.new_page()
 
                 # Navigate to Google homepage with English locale

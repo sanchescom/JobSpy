@@ -77,6 +77,8 @@ class LinkedIn(Scraper):
         :return: job_response
         """
         self.scraper_input = scraper_input
+        if scraper_input.country:
+            self.country = scraper_input.country
         job_list: list[JobPost] = []
         seen_ids = set()
         start = scraper_input.offset // 10 * 10 if scraper_input.offset else 0
@@ -307,7 +309,8 @@ class LinkedIn(Scraper):
         :param metadata_card
         :return: location
         """
-        location = Location(country=Country.from_string(self.country))
+        default_country = self.country if isinstance(self.country, Country) else Country.from_string(self.country)
+        location = Location(country=default_country)
         if metadata_card is not None:
             location_tag = metadata_card.find(
                 "span", class_="job-search-card__location"
@@ -319,7 +322,7 @@ class LinkedIn(Scraper):
                 location = Location(
                     city=city,
                     state=state,
-                    country=Country.from_string(self.country),
+                    country=default_country,
                 )
             elif len(parts) == 3:
                 city, state, country = parts

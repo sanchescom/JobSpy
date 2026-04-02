@@ -147,7 +147,10 @@ class Glassdoor(Scraper):
                 raise GlassdoorException(exc_msg)
             res_json = response.json()[0]
             if "errors" in res_json:
-                raise ValueError("Error encountered in API response")
+                error_paths = [e.get("path", []) for e in res_json["errors"]]
+                log.warning(f"Glassdoor: partial errors in response (paths: {error_paths})")
+            if "data" not in res_json or not res_json["data"].get("jobListings"):
+                raise ValueError("No job listings data in API response")
         except (
             requests.exceptions.ReadTimeout,
             GlassdoorException,
@@ -181,13 +184,17 @@ class Glassdoor(Scraper):
         """
         Fetches csrf token needed for API by visiting a generic page
         """
-        res = self.session.get(f"{self.base_url}/Job/computer-science-jobs.htm")
-        pattern = r'"token":\s*"([^"]+)"'
-        matches = re.findall(pattern, res.text)
-        token = None
-        if matches:
-            token = matches[0]
-        return token
+        try:
+            res = self.session.get(f"{self.base_url}/Job/computer-science-jobs.htm")
+            if res.status_code == 200:
+                pattern = r'"token":\s*"([^"]+)"'
+                matches = re.findall(pattern, res.text)
+                if matches:
+                    return matches[0]
+            log.warning(f"Glassdoor: CSRF page returned {res.status_code}, using fallback token")
+        except Exception as e:
+            log.warning(f"Glassdoor: CSRF fetch failed ({e}), using fallback token")
+        return None
 
     def _process_job(self, job_data):
         """

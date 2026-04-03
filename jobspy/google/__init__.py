@@ -319,7 +319,7 @@ class Google(Scraper):
         """HTTP-based initial page fetch (fallback)."""
         from jobspy.google.constant import headers_initial
         query = self._build_query()
-        params = {"q": query, "udm": "8"}
+        params = {"q": query, "udm": "8", "hl": "en"}
         response = self._session.get(self.url, headers=headers_initial, params=params)
         return self._parse_initial_html(response.text)
 

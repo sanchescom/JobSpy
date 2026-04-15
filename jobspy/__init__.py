@@ -15,6 +15,7 @@ from jobspy.linkedin import LinkedIn
 from jobspy.naukri import Naukri
 from jobspy.reed import Reed
 from jobspy.seek import Seek
+from jobspy.twitter import Twitter
 from jobspy.model import JobType, Location, JobResponse, Country
 from jobspy.model import SalarySource, ScraperInput, Site
 from jobspy.util import (
@@ -71,6 +72,7 @@ def scrape_jobs(
         Site.SEEK: Seek,
         Site.REED: Reed,
         Site.IRISH_JOBS: IrishJobs,
+        Site.TWITTER: Twitter,
     }
     set_logger_level(verbose)
     job_type = get_enum_from_value(job_type) if job_type else None
@@ -114,6 +116,10 @@ def scrape_jobs(
         scraper_kwargs = dict(proxies=proxies, ca_cert=ca_cert, user_agent=user_agent)
         if site == Site.REED and kwargs.get("reed_api_key"):
             scraper_kwargs["reed_api_key"] = kwargs["reed_api_key"]
+        if site == Site.TWITTER:
+            for k in ("twitter_accounts", "twitter_db_path"):
+                if kwargs.get(k):
+                    scraper_kwargs[k] = kwargs[k]
         scraper = scraper_class(**scraper_kwargs)
         scraped_data: JobResponse = scraper.scrape(scraper_input)
         cap_name = site.value.capitalize()

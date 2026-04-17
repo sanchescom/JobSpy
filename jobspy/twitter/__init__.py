@@ -9,6 +9,12 @@ from datetime import date
 
 from twscrape import API, AccountsPool
 
+# Patch twscrape's x.com HTML parser before we ever make a request — the upstream
+# parser is broken against the April 2026 page layout (IndexError in xclid.py).
+from jobspy.twitter._twscrape_patch import apply as _apply_twscrape_patch
+
+_apply_twscrape_patch()
+
 from jobspy.model import (
     JobPost,
     JobResponse,
@@ -18,9 +24,15 @@ from jobspy.model import (
     ScraperInput,
     Site,
 )
+from jobspy.twitter.browser_login import (
+    BrowserLoginError,
+    cookies_to_header,
+    login_via_browser,
+)
 from jobspy.twitter.constant import HASHTAG_GROUPS, MIN_TWEET_LENGTH
 from jobspy.twitter.util import (
     extract_company_from_tweet,
+    extract_country_from_tweet,
     extract_job_url_from_tweet,
     extract_location_from_tweet,
     extract_title_from_tweet,
@@ -76,27 +88,56 @@ class Twitter(Scraper):
     async def _scrape(self, query: str, limit: int) -> JobResponse:
         pool = AccountsPool(self.db_path)
 
-        # Register all accounts that aren't already in the pool
+        # Register all accounts that aren't already in the pool, and make
+        # sure each one has valid cookies (obtained via a real browser login
+        # because twscrape's HTTP login is blocked by Twitter's anti-bot).
         if self.accounts:
-            existing = await pool.get_all()
-            existing_usernames = {a.username for a in existing}
+            existing = {a.username: a for a in await pool.get_all()}
 
             for acc in self.accounts:
                 username = acc.get("username", "")
-                if not username or username in existing_usernames:
-                    continue
+                password = acc.get("password", "")
+                email = acc.get("email", "")
+                email_password = acc.get("email_password", "")
                 proxy = acc.get("proxy") or self.proxy_url
+
+                if not username or not password:
+                    log.warning("Skipping Twitter account without username/password")
+                    continue
+
+                db_acc = existing.get(username)
+                if db_acc and db_acc.active and "ct0" in db_acc.cookies:
+                    log.info("Twitter account %s already active, skipping login", username)
+                    continue
+
+                try:
+                    cookies = await asyncio.to_thread(
+                        login_via_browser,
+                        username,
+                        password,
+                        email=email or None,
+                        email_password=email_password or None,
+                        proxy=proxy,
+                    )
+                except BrowserLoginError as e:
+                    log.error("Browser login failed for %s: %s", username, e)
+                    continue
+
+                cookie_header = cookies_to_header(cookies)
+
+                if db_acc:
+                    # Reuse existing row but refresh cookies
+                    await pool.delete_accounts([username])
+
                 await pool.add_account(
                     username,
-                    acc.get("password", ""),
-                    acc.get("email", ""),
-                    acc.get("email_password", ""),
+                    password,
+                    email,
+                    email_password,
                     proxy=proxy,
+                    cookies=cookie_header,
                 )
-                log.info("Added Twitter account %s to pool", username)
-
-            # Login any accounts that don't have valid cookies yet
-            await pool.login_all()
+                log.info("Twitter account %s activated with fresh browser cookies", username)
 
         api = API(pool)
         jobs: list[JobPost] = []
@@ -174,7 +215,16 @@ class Twitter(Scraper):
 
         place = tweet.place if hasattr(tweet, "place") else None
         location_str = extract_location_from_tweet(text, place)
-        location = Location(city=location_str) if location_str else None
+
+        user_location = ""
+        if hasattr(tweet, "user") and tweet.user:
+            user_location = getattr(tweet.user, "location", "") or ""
+        country_code = extract_country_from_tweet(text, user_location, place)
+
+        if location_str or country_code:
+            location = Location(city=location_str, country=country_code)
+        else:
+            location = None
 
         date_posted = None
         if hasattr(tweet, "date") and tweet.date:

@@ -142,13 +142,20 @@ class Twitter(Scraper):
         api = API(pool)
         jobs: list[JobPost] = []
 
-        try:
+        async def _collect():
             async for tweet in api.search(query, limit=limit * 3):
                 job = self._parse_tweet(tweet)
                 if job:
                     jobs.append(job)
                     if len(jobs) >= limit:
                         break
+
+        try:
+            # Timeout prevents hanging when the single account is rate-limited
+            # and twscrape waits 15+ min for the next API slot.
+            await asyncio.wait_for(_collect(), timeout=60)
+        except asyncio.TimeoutError:
+            log.warning("Twitter search timed out after 60s with %d jobs collected", len(jobs))
         except Exception as e:
             log.error("Twitter search failed: %s", e)
 

@@ -88,6 +88,11 @@ class Twitter(Scraper):
     async def _scrape(self, query: str, limit: int) -> JobResponse:
         pool = AccountsPool(self.db_path)
 
+        # Clear any accumulated rate-limit locks so we start fresh.
+        # twscrape sets a 15-min lock on every failed/timed-out request;
+        # with a single account these stack up and can block searches for hours.
+        await pool.reset_locks()
+
         # Register all accounts that aren't already in the pool, and make
         # sure each one has valid cookies (obtained via a real browser login
         # because twscrape's HTTP login is blocked by Twitter's anti-bot).

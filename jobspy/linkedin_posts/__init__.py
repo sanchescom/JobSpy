@@ -308,17 +308,15 @@ class LinkedInPosts(Scraper):
         # Multiple concurrent scrape requests (e.g. different search terms)
         # would all try to launch Chrome with the same user_data_dir,
         # causing "SingletonLock: File exists" errors.  We serialize access
-        # with a file lock; only one browser instance runs at a time.
+        # with a blocking file lock so requests queue up instead of being
+        # dropped.
         lock_path = os.path.join(user_data_dir, ".chrome_lock")
         lock_fd = None
         try:
             lock_fd = open(lock_path, "w")
-            try:
-                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                log.warning("Another Chrome instance is using profile %s — skipping", username)
-                lock_fd.close()
-                return []
+            log.info("Waiting for Chrome profile lock (%s)...", username)
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)  # blocking wait
+            log.info("Acquired Chrome profile lock (%s)", username)
 
             # Clean up stale SingletonLock from a previous crash
             singleton_lock = os.path.join(user_data_dir, "SingletonLock")

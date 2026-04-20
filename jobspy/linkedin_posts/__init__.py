@@ -388,15 +388,26 @@ class LinkedInPosts(Scraper):
             jar = {c["name"]: c["value"] for c in context.cookies()}
             if "li_at" not in jar:
                 log.info("Injecting li_at cookie from LINKEDIN_LI_AT env var")
-                context.add_cookies([{
-                    "name": "li_at",
-                    "value": li_at_env,
-                    "domain": ".www.linkedin.com",
-                    "path": "/",
-                    "httpOnly": True,
-                    "secure": True,
-                    "sameSite": "None",
-                }])
+                context.add_cookies([
+                    {
+                        "name": "li_at",
+                        "value": li_at_env,
+                        "domain": ".linkedin.com",
+                        "path": "/",
+                        "httpOnly": True,
+                        "secure": True,
+                        "sameSite": "None",
+                    },
+                    {
+                        "name": "li_at",
+                        "value": li_at_env,
+                        "domain": ".www.linkedin.com",
+                        "path": "/",
+                        "httpOnly": True,
+                        "secure": True,
+                        "sameSite": "None",
+                    },
+                ])
 
         log.info("Checking for existing LinkedIn session")
         try:
@@ -421,34 +432,65 @@ class LinkedInPosts(Scraper):
         page.wait_for_timeout(random.randint(1500, 3000))
         _debug_screenshot(page, "02_login_page", username)
 
-        # Fill username — try multiple selectors since LinkedIn redesigns the page
-        log.info("Entering username")
-        username_selectors = [
-            "#username",
-            'input[name="session_key"]',
-            'input[autocomplete="username"]',
-            'input[type="text"]',
-        ]
-        username_input = None
-        for sel in username_selectors:
-            loc = page.locator(sel).first
-            try:
-                if loc.is_visible(timeout=2000):
-                    username_input = loc
-                    log.info("Found username input via: %s", sel)
-                    break
-            except Exception:
-                continue
-        if not username_input:
-            _debug_screenshot(page, "ERR_no_username_input", username)
-            raise RuntimeError("Could not locate username input on LinkedIn login page")
-        username_input.click()
-        page.wait_for_timeout(random.randint(200, 500))
-        for ch in username:
-            page.keyboard.type(ch)
-            page.wait_for_timeout(random.randint(30, 100))
+        # --- Handle "Welcome back" page (remembered account) ---
+        # LinkedIn may show a page with the user's name and a "click to sign in"
+        # button instead of the standard login form. We detect this and click
+        # the remembered account, then fill only the password.
+        remembered_account = None
+        try:
+            # The remembered account card is typically a clickable profile row
+            # Look for elements that contain the masked email
+            profile_cards = page.locator('[data-tracking-control-name="cold_join_sign_in"]')
+            if profile_cards.count() == 0:
+                # Also try a broad approach: any clickable profile-like element
+                profile_cards = page.locator('button:has-text("@"), a:has-text("@")')
+            if profile_cards.count() > 0:
+                remembered_account = profile_cards.first
+                log.info("Detected 'Welcome back' page with remembered account")
+        except Exception:
+            pass
 
-        page.wait_for_timeout(random.randint(300, 700))
+        if remembered_account:
+            # Click the remembered account card to proceed to password entry
+            log.info("Clicking remembered account to proceed to password")
+            remembered_account.click()
+            page.wait_for_timeout(random.randint(2000, 3000))
+            _debug_screenshot(page, "02b_after_remembered_click", username)
+
+            # Check if clicking the remembered account logged us in directly
+            jar = {c["name"]: c["value"] for c in context.cookies()}
+            if "li_at" in jar and "/login" not in page.url:
+                log.info("Remembered account click logged us in directly — skipping password")
+                return
+        else:
+            # Standard login form: fill username
+            log.info("Entering username")
+            username_selectors = [
+                "#username",
+                'input[name="session_key"]',
+                'input[autocomplete="username"]',
+                'input[type="text"]',
+            ]
+            username_input = None
+            for sel in username_selectors:
+                loc = page.locator(sel).first
+                try:
+                    if loc.is_visible(timeout=2000):
+                        username_input = loc
+                        log.info("Found username input via: %s", sel)
+                        break
+                except Exception:
+                    continue
+            if not username_input:
+                _debug_screenshot(page, "ERR_no_username_input", username)
+                raise RuntimeError("Could not locate username input on LinkedIn login page")
+            username_input.click()
+            page.wait_for_timeout(random.randint(200, 500))
+            for ch in username:
+                page.keyboard.type(ch)
+                page.wait_for_timeout(random.randint(30, 100))
+
+            page.wait_for_timeout(random.randint(300, 700))
 
         # Fill password — try multiple selectors
         log.info("Entering password")

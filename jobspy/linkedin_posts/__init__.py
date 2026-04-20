@@ -43,6 +43,10 @@ from jobspy.model import (
     ScraperInput,
     Site,
 )
+from jobspy.twitter.util import (
+    extract_country_from_tweet,
+    extract_location_from_tweet,
+)
 from jobspy.util import extract_job_type
 
 log = logging.getLogger("JobSpy:LinkedInPosts")
@@ -522,7 +526,7 @@ class LinkedInPosts(Scraper):
 
         company = self._extract_company(text, author, author_subtitle)
         date_posted = _parse_relative_time(time_text) if time_text else None
-        location = self._extract_location(text)
+        location = self._extract_location(text, author_subtitle)
         remote = _is_remote(text)
         job_types = extract_job_type(text)
 
@@ -592,18 +596,40 @@ class LinkedInPosts(Scraper):
         return author
 
     @staticmethod
-    def _extract_location(text: str) -> Location | None:
-        """Extract location from post text."""
+    def _extract_location(text: str, author_subtitle: str = "") -> Location | None:
+        """Extract location and country from post text.
+
+        Uses LinkedIn-specific patterns first (📍, "Remote locations:", etc.),
+        then falls back to the Twitter module's country detection which scans
+        for flag emojis, country/city names, currency symbols, phone prefixes,
+        and TLDs.
+        """
+        city = None
+
+        # LinkedIn-specific location patterns
         patterns = [
-            r"(?:location|based in|located in|office in)[:\s]+(.+?)(?:\n|$|\|)",
-            r"\U0001F4CD\s*(.+?)(?:\n|$)",  # pin emoji
+            r"(?:location|based in|located in|office in|remote locations?)[:\s]+(.+?)(?:\n|$|\||🏢|💰|💻)",
+            r"\U0001F4CD\s*(.+?)(?:\n|$)",  # 📍 pin emoji
         ]
         for pattern in patterns:
             match = re.search(pattern, text, re.IGNORECASE)
             if match:
-                loc = match.group(1).strip()
-                if loc:
-                    return Location(city=loc[:100])
+                city = match.group(1).strip().rstrip(",. ")
+                city = re.sub(r"\*+", "", city).strip()
+                if city:
+                    city = city[:100]
+                    break
+
+        # Fallback: use Twitter's location extractor (same regex patterns)
+        if not city:
+            city = extract_location_from_tweet(text)
+
+        # Country detection — reuse Twitter's multi-signal detector
+        # (flag emojis, country names, city names, currency, TLDs, etc.)
+        country = extract_country_from_tweet(text, author_subtitle)
+
+        if city or country:
+            return Location(city=city, country=country)
         return None
 
 

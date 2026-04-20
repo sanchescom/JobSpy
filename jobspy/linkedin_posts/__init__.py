@@ -463,36 +463,38 @@ class LinkedInPosts(Scraper):
                 log.info("Remembered account click logged us in directly — skipping password")
                 return
         else:
-            # Standard login form: fill username
+            # Standard login form: fill username.
+            # LinkedIn's React SPA sometimes renders inputs with
+            # display:contents on a parent, which Playwright's is_visible()
+            # incorrectly reports as hidden. We use count() + fill(force=True)
+            # to bypass this.
             log.info("Entering username")
             username_selectors = [
                 "#username",
                 'input[name="session_key"]',
                 'input[autocomplete="username"]',
+                'input[type="email"]',
                 'input[type="text"]',
             ]
-            username_input = None
+            username_filled = False
             for sel in username_selectors:
                 loc = page.locator(sel).first
                 try:
-                    if loc.is_visible(timeout=2000):
-                        username_input = loc
-                        log.info("Found username input via: %s", sel)
+                    if loc.count() > 0:
+                        loc.fill(username, force=True, timeout=5000)
+                        log.info("Filled username via: %s", sel)
+                        username_filled = True
                         break
-                except Exception:
+                except Exception as e:
+                    log.debug("Selector %s failed: %s", sel, e)
                     continue
-            if not username_input:
+            if not username_filled:
                 _debug_screenshot(page, "ERR_no_username_input", username)
                 raise RuntimeError("Could not locate username input on LinkedIn login page")
-            username_input.click()
-            page.wait_for_timeout(random.randint(200, 500))
-            for ch in username:
-                page.keyboard.type(ch)
-                page.wait_for_timeout(random.randint(30, 100))
 
             page.wait_for_timeout(random.randint(300, 700))
 
-        # Fill password — try multiple selectors
+        # Fill password
         log.info("Entering password")
         password_selectors = [
             "#password",
@@ -500,24 +502,21 @@ class LinkedInPosts(Scraper):
             'input[autocomplete="current-password"]',
             'input[type="password"]',
         ]
-        password_input = None
+        password_filled = False
         for sel in password_selectors:
             loc = page.locator(sel).first
             try:
-                if loc.is_visible(timeout=2000):
-                    password_input = loc
-                    log.info("Found password input via: %s", sel)
+                if loc.count() > 0:
+                    loc.fill(password, force=True, timeout=5000)
+                    log.info("Filled password via: %s", sel)
+                    password_filled = True
                     break
-            except Exception:
+            except Exception as e:
+                log.debug("Password selector %s failed: %s", sel, e)
                 continue
-        if not password_input:
+        if not password_filled:
             _debug_screenshot(page, "ERR_no_password_input", username)
             raise RuntimeError("Could not locate password input on LinkedIn login page")
-        password_input.click()
-        page.wait_for_timeout(random.randint(200, 500))
-        for ch in password:
-            page.keyboard.type(ch)
-            page.wait_for_timeout(random.randint(30, 100))
 
         page.wait_for_timeout(random.randint(300, 700))
         _debug_screenshot(page, "03_credentials_entered", username)

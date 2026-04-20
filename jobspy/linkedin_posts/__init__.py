@@ -230,19 +230,22 @@ class LinkedInPosts(Scraper):
 
         account = self.accounts[0]
         try:
-            jobs = await asyncio.wait_for(
+            result = await asyncio.wait_for(
                 asyncio.to_thread(self._browser_scrape, account, scraper_input),
                 timeout=120,
             )
         except asyncio.TimeoutError:
             log.error("LinkedIn Posts browser scrape timed out after 120s")
-            jobs = []
+            result = []
         except Exception as e:
             log.error("LinkedIn Posts scrape failed: %s", e)
-            jobs = []
+            result = []
 
-        log.info("Parsed %d job posts from LinkedIn Posts", len(jobs))
-        return JobResponse(jobs=jobs)
+        # None means "browser busy / lock contention" — not a real scrape
+        if result is None:
+            result = []
+        log.info("Parsed %d job posts from LinkedIn Posts", len(result))
+        return JobResponse(jobs=result)
 
     def _browser_scrape(
         self, account: dict, scraper_input: ScraperInput
@@ -307,15 +310,19 @@ class LinkedInPosts(Scraper):
         # --- File lock: Chrome allows only one instance per profile dir ---
         # Multiple concurrent scrape requests (e.g. different search terms)
         # would all try to launch Chrome with the same user_data_dir,
-        # causing "SingletonLock: File exists" errors.  We serialize access
-        # with a blocking file lock so requests queue up instead of being
-        # dropped.
+        # causing "SingletonLock: File exists" errors.  Non-blocking: if
+        # another instance holds the lock, skip gracefully (the caller
+        # should not penalize this as a real zero-result).
         lock_path = os.path.join(user_data_dir, ".chrome_lock")
         lock_fd = None
         try:
             lock_fd = open(lock_path, "w")
-            log.info("Waiting for Chrome profile lock (%s)...", username)
-            fcntl.flock(lock_fd, fcntl.LOCK_EX)  # blocking wait
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                log.warning("Another Chrome instance is using profile %s — skipping", username)
+                lock_fd.close()
+                return None  # None signals "busy", distinct from [] (real zero)
             log.info("Acquired Chrome profile lock (%s)", username)
 
             # Clean up stale SingletonLock from a previous crash

@@ -33,12 +33,6 @@ from jobspy.linkedin_posts.constant import (
     FEED_URL,
     LOGIN_URL,
     MIN_POST_LENGTH,
-    POST_ACTIVITY_LINK,
-    POST_AUTHOR,
-    POST_AUTHOR_SUBTITLE,
-    POST_CONTAINER,
-    POST_TEXT,
-    POST_TIMESTAMP,
     SEARCH_URL,
 )
 from jobspy.model import (
@@ -52,6 +46,137 @@ from jobspy.model import (
 from jobspy.util import extract_job_type
 
 log = logging.getLogger("JobSpy:LinkedInPosts")
+
+
+# JavaScript that runs inside the browser to extract posts from LinkedIn's
+# content search results.  LinkedIn uses hashed/obfuscated CSS class names
+# that change on every build, so we cannot rely on stable selectors.
+# Instead we:
+#   1. Walk down from <main> to find a container whose children repeat with
+#      the same tag (the post list).
+#   2. For each child (post), split innerText on the "Публикация в ленте"
+#      / "Feed post" header that LinkedIn prepends (screen-reader text),
+#      and extract author, subtitle, time, body text, and any linkedin.com
+#      activity links.
+_EXTRACT_POSTS_JS = """
+() => {
+    // ---- Step 1: find the repeating post container ----
+    // LinkedIn uses hashed CSS class names, so we walk down from <main>
+    // looking for a parent with the MOST same-tag children (the post list).
+    const main = document.querySelector('main');
+    if (!main) return [];
+
+    let bestGroup = null;
+    let bestCount = 0;
+
+    function findRepeating(el, depth) {
+        if (depth > 15) return;
+        const childTags = {};
+        for (const child of el.children) {
+            const cls = typeof child.className === 'string' ? child.className : '';
+            const key = child.tagName + '.' + cls.split(' ')[0];
+            if (!childTags[key]) childTags[key] = [];
+            childTags[key].push(child);
+        }
+        for (const [, group] of Object.entries(childTags)) {
+            const withText = group.filter(c => c.innerText && c.innerText.length > 100);
+            if (withText.length > bestCount) {
+                bestCount = withText.length;
+                bestGroup = withText;
+            }
+        }
+        for (const child of el.children) {
+            findRepeating(child, depth + 1);
+        }
+    }
+    findRepeating(main, 0);
+
+    if (!bestGroup || bestGroup.length < 1) return [];
+
+    // ---- Step 2: extract structured data from each post element ----
+    const posts = [];
+    for (const el of bestGroup) {
+        const text = el.innerText || '';
+        if (text.length < 50) continue;
+
+        // Skip footer/nav elements
+        if (/^(О компании|About|Справочный|Help Center|Условия|Terms|© LinkedIn)/i.test(text.trim())) continue;
+
+        const lines = text.split('\\n').map(l => l.trim()).filter(Boolean);
+
+        // Find author (first substantial line after preamble)
+        let author = '';
+        let subtitle = '';
+        let timeStr = '';
+        let bodyStart = 0;
+
+        // Pattern: header → author → connection info → subtitle → time → body
+        for (let i = 0; i < Math.min(lines.length, 12); i++) {
+            const line = lines[i];
+            // Skip preamble headers
+            if (/^(Публикация в ленте|Feed post|Promoted|Рекламируется)/i.test(line)) continue;
+            // Skip action buttons
+            if (/^(Отслеживать|Follow|\\+\\s*Отслеживать|\\+\\s*Follow)/i.test(line)) continue;
+            // Skip connection degree markers
+            if (/^[•·]/.test(line) || /^\\d-(й|nd|rd|th|st)/i.test(line)) continue;
+            // Skip single bullet/dot characters
+            if (line.length <= 2) continue;
+
+            if (!author) {
+                author = line;
+                continue;
+            }
+            // Time pattern: "5 ч." / "3d" / "2w" / "1mo" / "5 hours" / "5 ч. •"
+            const cleaned = line.replace(/[•·]/g, '').trim();
+            if (/^\\d+\\s*(ч|д|н|м|мин|h|d|w|mo|hr|min|sec|s|year|month|week|day|hour)/i.test(cleaned)) {
+                timeStr = cleaned;
+                bodyStart = i + 1;
+                break;
+            }
+            if (!subtitle && i < 8) {
+                subtitle = line;
+            }
+        }
+
+        // Body = everything after the time line, minus trailing action buttons
+        const bodyLines = [];
+        const stopPatterns = /^(Нравится|Like$|Комментировать|Comment$|Поделиться|Share$|Отправить|Send$|Показать перевод|Show translation|\\d+\\s*(реакц|reaction|comment|коммент|like|нравит))/i;
+        const skipPatterns = /^(…\\s*развернуть|…\\s*see more|развернуть|see more|Отслеживать|Follow|\\+\\s*Отслеживать|\\+\\s*Follow)$/i;
+        for (let i = bodyStart; i < lines.length; i++) {
+            if (stopPatterns.test(lines[i])) break;
+            if (skipPatterns.test(lines[i])) continue;
+            bodyLines.push(lines[i]);
+        }
+        const body = bodyLines.join('\\n');
+        if (body.length < 30) continue;
+
+        // Extract activity URL from links
+        let url = '';
+        const links = el.querySelectorAll('a[href]');
+        for (const a of links) {
+            const href = a.getAttribute('href') || '';
+            // Prefer feed/activity links
+            if (href.includes('/feed/update/') || href.includes('/activity/')) {
+                url = href.startsWith('http') ? href : 'https://www.linkedin.com' + href;
+                break;
+            }
+        }
+        // Fallback: author profile link
+        if (!url) {
+            for (const a of links) {
+                const href = a.getAttribute('href') || '';
+                if (href.includes('/in/') || href.includes('/company/')) {
+                    url = href.startsWith('http') ? href : 'https://www.linkedin.com' + href;
+                    break;
+                }
+            }
+        }
+
+        posts.push({ author, subtitle, time: timeStr, text: body, url });
+    }
+    return posts;
+}
+"""
 
 
 class LinkedInPosts(Scraper):
@@ -213,10 +338,27 @@ class LinkedInPosts(Scraper):
         page.wait_for_timeout(random.randint(1500, 3000))
         _debug_screenshot(page, "02_login_page", username)
 
-        # Fill username
+        # Fill username — try multiple selectors since LinkedIn redesigns the page
         log.info("Entering username")
-        username_input = page.locator("#username")
-        username_input.wait_for(state="visible", timeout=15000)
+        username_selectors = [
+            "#username",
+            'input[name="session_key"]',
+            'input[autocomplete="username"]',
+            'input[type="text"]',
+        ]
+        username_input = None
+        for sel in username_selectors:
+            loc = page.locator(sel).first
+            try:
+                if loc.is_visible(timeout=2000):
+                    username_input = loc
+                    log.info("Found username input via: %s", sel)
+                    break
+            except Exception:
+                continue
+        if not username_input:
+            _debug_screenshot(page, "ERR_no_username_input", username)
+            raise RuntimeError("Could not locate username input on LinkedIn login page")
         username_input.click()
         page.wait_for_timeout(random.randint(200, 500))
         for ch in username:
@@ -225,9 +367,27 @@ class LinkedInPosts(Scraper):
 
         page.wait_for_timeout(random.randint(300, 700))
 
-        # Fill password
+        # Fill password — try multiple selectors
         log.info("Entering password")
-        password_input = page.locator("#password")
+        password_selectors = [
+            "#password",
+            'input[name="session_password"]',
+            'input[autocomplete="current-password"]',
+            'input[type="password"]',
+        ]
+        password_input = None
+        for sel in password_selectors:
+            loc = page.locator(sel).first
+            try:
+                if loc.is_visible(timeout=2000):
+                    password_input = loc
+                    log.info("Found password input via: %s", sel)
+                    break
+            except Exception:
+                continue
+        if not password_input:
+            _debug_screenshot(page, "ERR_no_password_input", username)
+            raise RuntimeError("Could not locate password input on LinkedIn login page")
         password_input.click()
         page.wait_for_timeout(random.randint(200, 500))
         for ch in password:
@@ -285,7 +445,7 @@ class LinkedInPosts(Scraper):
     def _scrape_posts(
         self, page, scraper_input: ScraperInput
     ) -> list[JobPost]:
-        """Navigate to content search and parse post DOM."""
+        """Navigate to content search and extract posts via JS."""
         query = scraper_input.search_term or ""
         limit = scraper_input.results_wanted
 
@@ -304,129 +464,72 @@ class LinkedInPosts(Scraper):
 
         _debug_screenshot(page, "10_search_results", "scrape")
 
-        # Wait for post containers to appear
+        # Wait for content to appear (look for the post header text pattern)
         try:
-            page.wait_for_selector(POST_CONTAINER, timeout=15000)
+            page.wait_for_function(
+                "() => document.body.innerText.length > 1000",
+                timeout=15000,
+            )
         except Exception:
-            log.warning("No post containers found — page may not have loaded")
-            _debug_screenshot(page, "11_no_posts", "scrape")
+            log.warning("Page content didn't load in time")
+            _debug_screenshot(page, "11_no_content", "scrape")
             return []
 
         # Scroll to load more posts (infinite scroll)
         scroll_count = 5
         for i in range(scroll_count):
+            prev_len = page.evaluate("document.body.innerText.length")
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             page.wait_for_timeout(random.randint(1500, 3000))
-            current_count = page.locator(POST_CONTAINER).count()
-            log.info("Scroll %d/%d — %d posts visible", i + 1, scroll_count, current_count)
-            if current_count >= limit * 2:
+            new_len = page.evaluate("document.body.innerText.length")
+            log.info("Scroll %d/%d — text length %d→%d", i + 1, scroll_count, prev_len, new_len)
+            if new_len >= prev_len * 3:
                 break
 
         _debug_screenshot(page, "12_after_scroll", "scrape")
 
-        # Parse posts from DOM
-        posts = page.locator(POST_CONTAINER)
-        count = posts.count()
-        log.info("Found %d post containers to parse", count)
+        # Extract posts via JavaScript — LinkedIn uses hashed CSS class names
+        # that change on each build, so we find the repeating post container
+        # structurally: walk down from <main> to find a parent whose children
+        # repeat with the same tag+first-class pattern (≥2 siblings).
+        raw_posts = page.evaluate(_EXTRACT_POSTS_JS)
+        log.info("JS extraction returned %d raw posts", len(raw_posts))
 
         jobs: list[JobPost] = []
-        for i in range(count):
+        for raw in raw_posts:
             if len(jobs) >= limit:
                 break
-            try:
-                post = posts.nth(i)
-                job = self._parse_post(post, page)
-                if job:
-                    jobs.append(job)
-            except Exception as e:
-                log.debug("Failed to parse post %d: %s", i, e)
+            job = self._parse_raw_post(raw)
+            if job:
+                jobs.append(job)
 
         return jobs
 
-    def _parse_post(self, post, page) -> JobPost | None:
-        """Extract a JobPost from a single post DOM element."""
-        # Extract post text
-        text = ""
-        try:
-            text_el = post.locator(POST_TEXT).first
-            if text_el.count() > 0:
-                text = text_el.inner_text()
-        except Exception:
-            pass
-
-        if not text:
-            # Fallback: try getting all text from the description area
-            try:
-                text = post.locator("div.feed-shared-update-v2__description").first.inner_text()
-            except Exception:
-                pass
-
+    def _parse_raw_post(self, raw: dict) -> JobPost | None:
+        """Convert a raw JS-extracted post dict into a JobPost."""
+        text = raw.get("text", "")
         if len(text) < MIN_POST_LENGTH:
             return None
 
-        # Extract author name
-        author = ""
-        try:
-            author_el = post.locator(POST_AUTHOR).first
-            if author_el.count() > 0:
-                author = author_el.inner_text().strip()
-        except Exception:
-            pass
+        author = raw.get("author", "")
+        author_subtitle = raw.get("subtitle", "")
+        post_url = raw.get("url", "")
+        time_text = raw.get("time", "")
 
-        # Extract author subtitle (often contains company/title info)
-        author_subtitle = ""
-        try:
-            subtitle_el = post.locator(POST_AUTHOR_SUBTITLE).first
-            if subtitle_el.count() > 0:
-                author_subtitle = subtitle_el.inner_text().strip()
-        except Exception:
-            pass
-
-        # Extract activity URL (urn:li:activity:*)
-        post_url = ""
-        try:
-            link_el = post.locator(POST_ACTIVITY_LINK).first
-            if link_el.count() > 0:
-                post_url = link_el.get_attribute("href") or ""
-                if post_url and not post_url.startswith("http"):
-                    post_url = f"https://www.linkedin.com{post_url}"
-        except Exception:
-            pass
-
-        if not post_url:
-            # Try data-urn attribute
-            try:
-                urn = post.get_attribute("data-urn") or ""
-                if "activity" in urn:
-                    activity_id = urn.split(":")[-1]
-                    post_url = f"https://www.linkedin.com/feed/update/urn:li:activity:{activity_id}/"
-            except Exception:
-                pass
-
-        # Extract title from first line or regex
         title = self._extract_title(text)
         if not title:
             return None
 
-        # Extract company from author subtitle or text
         company = self._extract_company(text, author, author_subtitle)
-
-        # Determine date
-        date_posted = self._extract_date(post)
-
-        # Location from text
+        date_posted = _parse_relative_time(time_text) if time_text else None
         location = self._extract_location(text)
-
-        # Remote detection
         remote = _is_remote(text)
-
-        # Job type
         job_types = extract_job_type(text)
 
         return JobPost(
             title=title,
             company_name=company,
-            job_url=post_url or "",
+            job_url=post_url,
             location=location,
             description=text,
             date_posted=date_posted,
@@ -438,24 +541,29 @@ class LinkedInPosts(Scraper):
     def _extract_title(text: str) -> str | None:
         """Extract a job title from post text."""
         patterns = [
-            r"(?:hiring|looking for|we need|open position|job opening|now hiring)[:\s]+(.+?)(?:\n|$)",
-            r"^(.+?)\s+(?:needed|wanted|required)",
+            # "HIRING: PHP Developer – $50–120/hour" → "PHP Developer – $50–120/hour"
+            # Stop at sentence-ending punctuation, emoji blocks, or "Employment"
+            r"\*{0,2}(?:hiring|looking for|we need|now hiring)[:\s*]+(.+?)(?:\*{2}|\n|[.!](?:\s|$)|🏢|📍|💰|Employment|$)",
+            r"(?:open position|job opening)[:\s]+(.+?)(?:\n|$)",
             r"(?:role|position)[:\s]+(.+?)(?:\n|$)",
         ]
         for pattern in patterns:
             match = re.search(pattern, text, re.IGNORECASE)
             if match:
                 title = match.group(1).strip()
+                # Strip markdown bold markers, hashtags, trailing punctuation
+                title = re.sub(r"\*{2}", "", title)
                 title = re.sub(r"\s*#\S+", "", title).strip()
+                title = title.rstrip("*:").strip()
                 if len(title) > 5:
                     return title[:150]
 
-        # Fallback: first non-empty line
+        # Fallback: first non-empty line (stripped of emojis and symbols)
         for line in text.split("\n"):
             line = line.strip()
             if len(line) > 10:
-                cleaned = re.sub(r"^[#@\s]+", "", line).strip()
-                if cleaned:
+                cleaned = re.sub(r"^[\U0001F300-\U0001FAFF#@*\s]+", "", line).strip()
+                if cleaned and len(cleaned) > 5:
                     return cleaned[:100]
         return None
 
@@ -484,23 +592,6 @@ class LinkedInPosts(Scraper):
         return author
 
     @staticmethod
-    def _extract_date(post) -> date | None:
-        """Try to extract post date from DOM."""
-        try:
-            time_el = post.locator(POST_TIMESTAMP).first
-            if time_el.count() > 0:
-                datetime_attr = time_el.get_attribute("datetime")
-                if datetime_attr:
-                    return datetime.fromisoformat(datetime_attr.replace("Z", "+00:00")).date()
-
-                # Fallback: parse relative time text like "3d", "1w", "2h"
-                time_text = time_el.inner_text().strip().lower()
-                return _parse_relative_time(time_text)
-        except Exception:
-            pass
-        return None
-
-    @staticmethod
     def _extract_location(text: str) -> Location | None:
         """Extract location from post text."""
         patterns = [
@@ -524,21 +615,34 @@ def _is_remote(text: str) -> bool:
 
 
 def _parse_relative_time(text: str) -> date | None:
-    """Parse LinkedIn relative timestamps like '3d', '1w', '2h' into a date."""
-    match = re.match(r"(\d+)\s*([hdwmo])", text)
+    """Parse LinkedIn relative timestamps into a date.
+
+    Handles both English ('3d', '1w', '2h') and Russian ('5 ч.', '3 д.', '1 н.')
+    formats that LinkedIn uses depending on locale.
+    """
+    text = text.strip().lower().rstrip(".")
+    # Match patterns like "5 ч", "3d", "1 н", "2w", "1mo"
+    match = re.match(r"(\d+)\s*(\S+)", text)
     if not match:
         return None
     value = int(match.group(1))
-    unit = match.group(2)
+    unit = match.group(2).rstrip(".")
     now = datetime.now(timezone.utc)
-    if unit == "h":
+    # Hours: h, hr, hrs, hour, hours, ч, час
+    if unit in ("h", "hr", "hrs", "hour", "hours", "ч", "час"):
         return now.date()
-    elif unit == "d":
+    # Days: d, day, days, д, дн, дня, дней, день
+    elif unit in ("d", "day", "days", "д", "дн", "дня", "дней", "день"):
         return (now - timedelta(days=value)).date()
-    elif unit == "w":
+    # Weeks: w, wk, week, weeks, н, нед, нед
+    elif unit in ("w", "wk", "week", "weeks", "н", "нед"):
         return (now - timedelta(weeks=value)).date()
-    elif unit == "m" or unit == "o":
+    # Months: m, mo, month, months, мес
+    elif unit in ("m", "mo", "month", "months", "мес"):
         return (now - timedelta(days=value * 30)).date()
+    # Minutes: min, мин
+    elif unit in ("min", "мин", "минут"):
+        return now.date()
     return None
 
 

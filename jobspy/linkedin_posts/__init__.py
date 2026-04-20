@@ -481,7 +481,9 @@ class LinkedInPosts(Scraper):
                 loc = page.locator(sel).first
                 try:
                     if loc.count() > 0:
-                        loc.fill(username, force=True, timeout=5000)
+                        loc.click(force=True, timeout=5000)
+                        page.wait_for_timeout(random.randint(200, 500))
+                        page.keyboard.type(username, delay=random.randint(30, 80))
                         log.info("Filled username via: %s", sel)
                         username_filled = True
                         break
@@ -507,7 +509,9 @@ class LinkedInPosts(Scraper):
             loc = page.locator(sel).first
             try:
                 if loc.count() > 0:
-                    loc.fill(password, force=True, timeout=5000)
+                    loc.click(force=True, timeout=5000)
+                    page.wait_for_timeout(random.randint(200, 500))
+                    page.keyboard.type(password, delay=random.randint(30, 80))
                     log.info("Filled password via: %s", sel)
                     password_filled = True
                     break

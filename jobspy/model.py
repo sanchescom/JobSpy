@@ -297,6 +297,7 @@ class Site(Enum):
     REED = "reed"
     IRISH_JOBS = "irish_jobs"
     TWITTER = "twitter"
+    LINKEDIN_POSTS = "linkedin_posts"
 
 
 class SalarySource(Enum):

@@ -16,6 +16,7 @@ from jobspy.naukri import Naukri
 from jobspy.reed import Reed
 from jobspy.seek import Seek
 from jobspy.twitter import Twitter
+from jobspy.linkedin_posts import LinkedInPosts
 from jobspy.model import JobType, Location, JobResponse, Country
 from jobspy.model import SalarySource, ScraperInput, Site
 from jobspy.util import (
@@ -73,6 +74,7 @@ def scrape_jobs(
         Site.REED: Reed,
         Site.IRISH_JOBS: IrishJobs,
         Site.TWITTER: Twitter,
+        Site.LINKEDIN_POSTS: LinkedInPosts,
     }
     set_logger_level(verbose)
     job_type = get_enum_from_value(job_type) if job_type else None
@@ -118,6 +120,10 @@ def scrape_jobs(
             scraper_kwargs["reed_api_key"] = kwargs["reed_api_key"]
         if site == Site.TWITTER:
             for k in ("twitter_accounts", "twitter_db_path"):
+                if kwargs.get(k):
+                    scraper_kwargs[k] = kwargs[k]
+        if site == Site.LINKEDIN_POSTS:
+            for k in ("linkedin_accounts", "linkedin_profile_dir"):
                 if kwargs.get(k):
                     scraper_kwargs[k] = kwargs[k]
         scraper = scraper_class(**scraper_kwargs)

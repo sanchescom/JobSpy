@@ -286,6 +286,23 @@ class LinkedInPosts(Scraper):
         user_data_dir = os.path.join(self.profile_dir, username)
         os.makedirs(user_data_dir, exist_ok=True)
 
+        # --- Anti-ban: per-account cooldown ---
+        cooldown_min = int(os.getenv("LINKEDIN_COOLDOWN_MINUTES", "10"))
+        cooldown_file = os.path.join(user_data_dir, ".last_scrape")
+        if os.path.exists(cooldown_file):
+            try:
+                last_ts = float(open(cooldown_file).read().strip())
+                elapsed = datetime.now(timezone.utc).timestamp() - last_ts
+                if elapsed < cooldown_min * 60:
+                    remaining = int(cooldown_min * 60 - elapsed)
+                    log.warning(
+                        "Account %s on cooldown — %ds remaining (min %d min between scrapes)",
+                        username, remaining, cooldown_min,
+                    )
+                    return []
+            except (ValueError, OSError):
+                pass
+
         try:
             with sync_playwright() as p:
                 launch_kwargs: dict = {
@@ -306,8 +323,20 @@ class LinkedInPosts(Scraper):
                     # === Login or session check ===
                     self._ensure_logged_in(context, page, username, password)
 
+                    # === Human-like: visit feed briefly before searching ===
+                    self._browse_feed(page)
+
                     # === Scrape ===
-                    return self._scrape_posts(page, scraper_input)
+                    result = self._scrape_posts(page, scraper_input)
+
+                    # Update cooldown timestamp on success
+                    try:
+                        with open(cooldown_file, "w") as f:
+                            f.write(str(datetime.now(timezone.utc).timestamp()))
+                    except OSError:
+                        pass
+
+                    return result
                 finally:
                     try:
                         context.close()
@@ -446,6 +475,24 @@ class LinkedInPosts(Scraper):
 
         log.info("Successfully logged in as %s", username)
 
+    @staticmethod
+    def _browse_feed(page) -> None:
+        """Briefly visit the feed to look like a normal user before searching.
+
+        LinkedIn tracks navigation patterns; jumping straight to /search/
+        after login is a bot signal.  A real user would glance at their feed
+        first.
+        """
+        log.info("Visiting feed briefly (anti-detection)")
+        try:
+            page.goto(FEED_URL, wait_until="domcontentloaded", timeout=20000)
+            page.wait_for_timeout(random.randint(2000, 5000))
+            # Scroll down a bit like a human glancing at their feed
+            page.evaluate("window.scrollBy(0, 400)")
+            page.wait_for_timeout(random.randint(1000, 3000))
+        except Exception as e:
+            log.debug("Feed browse failed (non-critical): %s", e)
+
     def _scrape_posts(
         self, page, scraper_input: ScraperInput
     ) -> list[JobPost]:
@@ -480,11 +527,13 @@ class LinkedInPosts(Scraper):
             return []
 
         # Scroll to load more posts (infinite scroll)
-        scroll_count = 5
+        # Slow, human-like scrolling — LinkedIn monitors scroll velocity.
+        scroll_count = 4
         for i in range(scroll_count):
             prev_len = page.evaluate("document.body.innerText.length")
-            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            page.wait_for_timeout(random.randint(1500, 3000))
+            # Scroll in smaller increments instead of jumping to bottom
+            page.evaluate("window.scrollBy(0, window.innerHeight * 1.5)")
+            page.wait_for_timeout(random.randint(3000, 6000))
             new_len = page.evaluate("document.body.innerText.length")
             log.info("Scroll %d/%d — text length %d→%d", i + 1, scroll_count, prev_len, new_len)
             if new_len >= prev_len * 3:

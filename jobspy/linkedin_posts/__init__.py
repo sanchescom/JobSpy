@@ -21,6 +21,7 @@ working API.
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import json
 import logging
 import os
@@ -303,7 +304,31 @@ class LinkedInPosts(Scraper):
             except (ValueError, OSError):
                 pass
 
+        # --- File lock: Chrome allows only one instance per profile dir ---
+        # Multiple concurrent scrape requests (e.g. different search terms)
+        # would all try to launch Chrome with the same user_data_dir,
+        # causing "SingletonLock: File exists" errors.  We serialize access
+        # with a file lock; only one browser instance runs at a time.
+        lock_path = os.path.join(user_data_dir, ".chrome_lock")
+        lock_fd = None
         try:
+            lock_fd = open(lock_path, "w")
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                log.warning("Another Chrome instance is using profile %s — skipping", username)
+                lock_fd.close()
+                return []
+
+            # Clean up stale SingletonLock from a previous crash
+            singleton_lock = os.path.join(user_data_dir, "SingletonLock")
+            if os.path.exists(singleton_lock):
+                try:
+                    os.remove(singleton_lock)
+                    log.info("Removed stale SingletonLock")
+                except OSError:
+                    pass
+
             with sync_playwright() as p:
                 launch_kwargs: dict = {
                     "channel": "chrome",
@@ -343,6 +368,12 @@ class LinkedInPosts(Scraper):
                     except Exception:
                         pass
         finally:
+            if lock_fd:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                    lock_fd.close()
+                except Exception:
+                    pass
             if relay:
                 relay.stop()
 

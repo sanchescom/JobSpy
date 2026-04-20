@@ -348,6 +348,25 @@ class LinkedInPosts(Scraper):
 
     def _ensure_logged_in(self, context, page, username: str, password: str) -> None:
         """Check for existing session; if not logged in, perform full login."""
+        # Fast-path: if LINKEDIN_LI_AT env var is set, inject the cookie
+        # directly and skip the full login flow. This is essential for
+        # server deployments where Chrome's cookie encryption is platform-
+        # specific and profiles can't be copied between macOS and Linux.
+        li_at_env = os.getenv("LINKEDIN_LI_AT")
+        if li_at_env:
+            jar = {c["name"]: c["value"] for c in context.cookies()}
+            if "li_at" not in jar:
+                log.info("Injecting li_at cookie from LINKEDIN_LI_AT env var")
+                context.add_cookies([{
+                    "name": "li_at",
+                    "value": li_at_env,
+                    "domain": ".www.linkedin.com",
+                    "path": "/",
+                    "httpOnly": True,
+                    "secure": True,
+                    "sameSite": "None",
+                }])
+
         log.info("Checking for existing LinkedIn session")
         try:
             page.goto(FEED_URL, wait_until="domcontentloaded", timeout=30000)

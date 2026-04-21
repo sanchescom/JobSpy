@@ -249,13 +249,14 @@ class LinkedInPosts(Scraper):
             return JobResponse(jobs=[])
 
         account = self.accounts[0]
+        timeout = int(os.getenv("LINKEDIN_SCRAPE_TIMEOUT", "180"))
         try:
             result = await asyncio.wait_for(
                 asyncio.to_thread(self._browser_scrape, account, scraper_input),
-                timeout=120,
+                timeout=timeout,
             )
         except asyncio.TimeoutError:
-            log.error("LinkedIn Posts browser scrape timed out after 120s")
+            log.error("LinkedIn Posts browser scrape timed out after %ds", timeout)
             result = []
         except Exception as e:
             log.error("LinkedIn Posts scrape failed: %s", e)
@@ -580,26 +581,46 @@ class LinkedInPosts(Scraper):
         page.wait_for_timeout(random.randint(3000, 5000))
         _debug_screenshot(page, "04_after_submit", username)
 
-        # CAPTCHA / challenge: manual intervention
-        manual = os.getenv("LINKEDIN_LOGIN_MANUAL_CODE") == "1"
-        if manual and ("/checkpoint" in page.url or "/challenge" in page.url):
-            wait_s = int(os.getenv("LINKEDIN_LOGIN_MANUAL_TIMEOUT", "300"))
-            log.info(
-                "Challenge detected — manual mode. Please solve in the browser window. "
-                "Waiting up to %ds...", wait_s
+        # Email verification checkpoint — LinkedIn sends a code to the
+        # account's email. We poll a well-known file for the code (the user
+        # or an external script writes it there after reading the email).
+        # This is normally a ONE-TIME step: after verification, LinkedIn
+        # trusts the persistent Chrome profile for future logins.
+        if "/checkpoint" in page.url or "/challenge" in page.url:
+            _debug_screenshot(page, "05_checkpoint", username)
+            has_code_input = page.evaluate(
+                "() => !!document.querySelector("
+                "'input[name=\"pin\"], input[placeholder*=\"code\" i], "
+                "input[aria-label*=\"code\" i], input[id=\"input__email_verification_pin\"]')"
             )
-            deadline = datetime.now(timezone.utc).timestamp() + wait_s
-            while datetime.now(timezone.utc).timestamp() < deadline:
-                jar = {c["name"]: c["value"] for c in context.cookies()}
-                if "li_at" in jar:
-                    log.info("Challenge cleared (li_at cookie appeared)")
-                    break
-                current_url = page.url
-                if "/feed" in current_url and "/login" not in current_url:
-                    log.info("Challenge cleared (redirected to feed)")
-                    break
-                page.wait_for_timeout(1000)
-            _debug_screenshot(page, "05_after_challenge", username)
+            if has_code_input:
+                code_file = os.path.join(self.profile_dir, username, ".verification_code")
+                wait_s = int(os.getenv("LINKEDIN_VERIFY_TIMEOUT", "300"))
+                log.warning(
+                    "EMAIL VERIFICATION REQUIRED. LinkedIn sent a code to %s. "
+                    "Write the 6-digit code to: %s  (waiting %ds)",
+                    username, code_file, wait_s,
+                )
+                code = _poll_verification_code(code_file, wait_s)
+                if code:
+                    log.info("Got verification code, entering it")
+                    _js_fill_input(page, [
+                        'input[name="pin"]',
+                        'input[placeholder*="code" i]',
+                        'input[aria-label*="code" i]',
+                        'input[id="input__email_verification_pin"]',
+                    ], code)
+                    page.wait_for_timeout(random.randint(500, 1000))
+                    page.keyboard.press("Enter")
+                    page.wait_for_timeout(random.randint(3000, 5000))
+                    _debug_screenshot(page, "06_after_verification", username)
+                else:
+                    log.error("Verification code not provided within %ds", wait_s)
+            else:
+                log.warning(
+                    "Non-email checkpoint detected (CAPTCHA/security check). URL: %s",
+                    page.url,
+                )
 
         # Wait for login to settle
         log.info("Waiting for login to settle")
@@ -824,6 +845,29 @@ class LinkedInPosts(Scraper):
         if city or country:
             return Location(city=city, country=country)
         return None
+
+
+def _poll_verification_code(code_file: str, timeout: int = 300) -> str | None:
+    """Poll a file for LinkedIn's email verification code.
+
+    The user (or an automated email reader) writes the 6-digit code to
+    ``code_file``.  We check every 3 seconds until the timeout expires.
+    """
+    import time
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if os.path.exists(code_file):
+            try:
+                code = open(code_file).read().strip()
+                os.remove(code_file)
+                if code and len(code) >= 4:
+                    log.info("Read verification code from %s", code_file)
+                    return code
+            except OSError:
+                pass
+        time.sleep(3)
+    return None
 
 
 def _js_fill_input(page, selectors: list[str], value: str) -> bool:

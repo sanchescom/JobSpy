@@ -67,47 +67,13 @@ log = logging.getLogger("JobSpy:LinkedInPosts")
 #      activity links.
 _EXTRACT_POSTS_JS = """
 () => {
-    // ---- Step 1: find the repeating post container ----
-    // LinkedIn uses hashed CSS class names, so we walk down from <main>
-    // looking for a parent with the MOST same-tag children (the post list).
-    const main = document.querySelector('main');
-    if (!main) return [];
-
-    let bestGroup = null;
-    let bestCount = 0;
-
-    function findRepeating(el, depth) {
-        if (depth > 15) return;
-        const childTags = {};
-        for (const child of el.children) {
-            const cls = typeof child.className === 'string' ? child.className : '';
-            const key = child.tagName + '.' + cls.split(' ')[0];
-            if (!childTags[key]) childTags[key] = [];
-            childTags[key].push(child);
-        }
-        for (const [, group] of Object.entries(childTags)) {
-            const withText = group.filter(c => c.innerText && c.innerText.length > 100);
-            if (withText.length > bestCount) {
-                bestCount = withText.length;
-                bestGroup = withText;
-            }
-        }
-        for (const child of el.children) {
-            findRepeating(child, depth + 1);
-        }
-    }
-    findRepeating(main, 0);
-
-    if (!bestGroup || bestGroup.length < 1) return [];
-
-    // ---- Step 2: extract structured data from each post element ----
-    const posts = [];
-    for (const el of bestGroup) {
+    // ---- helper: extract structured data from a post element ----
+    function parsePost(el) {
         const text = el.innerText || '';
-        if (text.length < 50) continue;
+        if (text.length < 50) return null;
 
-        // Skip footer/nav elements
-        if (/^(О компании|About|Справочный|Help Center|Условия|Terms|© LinkedIn)/i.test(text.trim())) continue;
+        // Skip footer/nav/sidebar elements
+        if (/^(О компании|About|Справочный|Help Center|Условия|Terms|© LinkedIn|Messaging|Сообщения)/i.test(text.trim())) return null;
 
         const lines = text.split('\\n').map(l => l.trim()).filter(Boolean);
 
@@ -120,20 +86,15 @@ _EXTRACT_POSTS_JS = """
         // Pattern: header → author → connection info → subtitle → time → body
         for (let i = 0; i < Math.min(lines.length, 12); i++) {
             const line = lines[i];
-            // Skip preamble headers
             if (/^(Публикация в ленте|Feed post|Promoted|Рекламируется)/i.test(line)) continue;
-            // Skip action buttons
             if (/^(Отслеживать|Follow|\\+\\s*Отслеживать|\\+\\s*Follow)/i.test(line)) continue;
-            // Skip connection degree markers
             if (/^[•·]/.test(line) || /^\\d-(й|nd|rd|th|st)/i.test(line)) continue;
-            // Skip single bullet/dot characters
             if (line.length <= 2) continue;
 
             if (!author) {
                 author = line;
                 continue;
             }
-            // Time pattern: "5 ч." / "3d" / "2w" / "1mo" / "5 hours" / "5 ч. •"
             const cleaned = line.replace(/[•·]/g, '').trim();
             if (/^\\d+\\s*(ч|д|н|м|мин|h|d|w|mo|hr|min|sec|s|year|month|week|day|hour)/i.test(cleaned)) {
                 timeStr = cleaned;
@@ -155,20 +116,18 @@ _EXTRACT_POSTS_JS = """
             bodyLines.push(lines[i]);
         }
         const body = bodyLines.join('\\n');
-        if (body.length < 30) continue;
+        if (body.length < 20) return null;
 
         // Extract activity URL from links
         let url = '';
         const links = el.querySelectorAll('a[href]');
         for (const a of links) {
             const href = a.getAttribute('href') || '';
-            // Prefer feed/activity links
             if (href.includes('/feed/update/') || href.includes('/activity/')) {
                 url = href.startsWith('http') ? href : 'https://www.linkedin.com' + href;
                 break;
             }
         }
-        // Fallback: author profile link
         if (!url) {
             for (const a of links) {
                 const href = a.getAttribute('href') || '';
@@ -179,7 +138,61 @@ _EXTRACT_POSTS_JS = """
             }
         }
 
-        posts.push({ author, subtitle, time: timeStr, text: body, url });
+        return { author, subtitle, time: timeStr, text: body, url };
+    }
+
+    // ---- Strategy 1: data-urn attribute (most reliable) ----
+    // LinkedIn search results have data-urn="urn:li:activity:..." on post containers
+    let postEls = Array.from(document.querySelectorAll('[data-urn*="activity"], [data-urn*="ugcPost"]'));
+
+    // ---- Strategy 2: feed-shared-update-v2 class (may survive builds) ----
+    if (postEls.length === 0) {
+        postEls = Array.from(document.querySelectorAll('div.feed-shared-update-v2'));
+    }
+
+    // ---- Strategy 3: heuristic — find repeating container from <main> ----
+    if (postEls.length === 0) {
+        const main = document.querySelector('main');
+        if (!main) return [];
+
+        let bestGroup = null;
+        let bestCount = 0;
+
+        function findRepeating(el, depth) {
+            if (depth > 15) return;
+            const childTags = {};
+            for (const child of el.children) {
+                const cls = typeof child.className === 'string' ? child.className : '';
+                const key = child.tagName + '.' + cls.split(' ')[0];
+                if (!childTags[key]) childTags[key] = [];
+                childTags[key].push(child);
+            }
+            for (const [, group] of Object.entries(childTags)) {
+                const withText = group.filter(c => c.innerText && c.innerText.length > 60);
+                if (withText.length > bestCount) {
+                    bestCount = withText.length;
+                    bestGroup = withText;
+                }
+            }
+            for (const child of el.children) {
+                findRepeating(child, depth + 1);
+            }
+        }
+        findRepeating(main, 0);
+        postEls = bestGroup || [];
+    }
+
+    // ---- Parse all found elements ----
+    const posts = [];
+    const seen = new Set();
+    for (const el of postEls) {
+        const parsed = parsePost(el);
+        if (!parsed) continue;
+        // Deduplicate by first 80 chars of body text
+        const key = parsed.text.slice(0, 80);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        posts.push(parsed);
     }
     return posts;
 }
@@ -691,18 +704,39 @@ class LinkedInPosts(Scraper):
             _debug_screenshot(page, "11_no_content", "scrape")
             return []
 
-        # Scroll to load more posts (infinite scroll)
-        # Slow, human-like scrolling — LinkedIn monitors scroll velocity.
-        scroll_count = 4
-        for i in range(scroll_count):
+        # Scroll to load more posts (infinite scroll).
+        # LinkedIn's infinite scroll trigger is at the bottom of the results
+        # list — an IntersectionObserver fires when a sentinel element enters
+        # the viewport.  scrollBy(innerHeight) often doesn't reach it.
+        # Strategy: scroll to document bottom, wait for new content, repeat.
+        max_scrolls = int(os.getenv("LINKEDIN_MAX_SCROLLS", "12"))
+        stale_rounds = 0
+        for i in range(max_scrolls):
             prev_len = page.evaluate("document.body.innerText.length")
-            # Scroll in smaller increments instead of jumping to bottom
-            page.evaluate("window.scrollBy(0, window.innerHeight * 1.5)")
-            page.wait_for_timeout(random.randint(3000, 6000))
+            # Scroll to bottom to trigger the infinite scroll sentinel
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            # Wait for network + render (LinkedIn XHR + React hydration)
+            page.wait_for_timeout(random.randint(2500, 4500))
+            # Extra wait: check if content is still loading
+            try:
+                page.wait_for_function(
+                    f"() => document.body.innerText.length > {prev_len}",
+                    timeout=5000,
+                )
+            except Exception:
+                pass
             new_len = page.evaluate("document.body.innerText.length")
-            log.info("Scroll %d/%d — text length %d→%d", i + 1, scroll_count, prev_len, new_len)
-            if new_len >= prev_len * 3:
-                break
+            log.info("Scroll %d/%d — text length %d→%d", i + 1, max_scrolls, prev_len, new_len)
+            if new_len <= prev_len:
+                stale_rounds += 1
+                if stale_rounds >= 3:
+                    log.info("No new content after %d stale scrolls — stopping", stale_rounds)
+                    break
+            else:
+                stale_rounds = 0
+
+        # Expand truncated posts ("...see more" / "…развернуть") to get full text
+        _expand_truncated_posts(page)
 
         _debug_screenshot(page, "12_after_scroll", "scrape")
 
@@ -757,13 +791,18 @@ class LinkedInPosts(Scraper):
 
     @staticmethod
     def _extract_title(text: str) -> str | None:
-        """Extract a job title from post text."""
+        """Extract a job title from post text.
+
+        Tries specific hiring-related patterns first, then falls back to the
+        first substantial line. Returns None only for very short/empty posts.
+        """
         patterns = [
             # "HIRING: PHP Developer – $50–120/hour" → "PHP Developer – $50–120/hour"
-            # Stop at sentence-ending punctuation, emoji blocks, or "Employment"
-            r"\*{0,2}(?:hiring|looking for|we need|now hiring)[:\s*]+(.+?)(?:\*{2}|\n|[.!](?:\s|$)|🏢|📍|💰|Employment|$)",
-            r"(?:open position|job opening)[:\s]+(.+?)(?:\n|$)",
+            r"\*{0,2}(?:hiring|looking for|we need|now hiring|ищем|ищу|набираем|вакансия|vacancy)[:\s*]+(.+?)(?:\*{2}|\n|[.!](?:\s|$)|🏢|📍|💰|Employment|$)",
+            r"(?:open position|job opening|hot job|job alert|job opportunity)[:\s]+(.+?)(?:\n|$)",
             r"(?:role|position)[:\s]+(.+?)(?:\n|$)",
+            # "🚀 Senior PHP Developer needed" → "Senior PHP Developer needed"
+            r"[\U0001F300-\U0001FAFF\s]*([A-Z][A-Za-z\s]+(?:Developer|Engineer|Designer|Manager|Lead|Architect|Analyst|Consultant|Specialist|Intern|Coordinator|Director|VP|CTO|CEO)[\w\s–\-/]*?)(?:\n|[.!](?:\s|$)|$)",
         ]
         for pattern in patterns:
             match = re.search(pattern, text, re.IGNORECASE)
@@ -894,6 +933,42 @@ def _js_fill_input(page, selectors: list[str], value: str) -> bool:
         }""",
         [css, value],
     )
+
+
+def _expand_truncated_posts(page) -> None:
+    """Click all 'see more' / 'развернуть' buttons to expand truncated posts.
+
+    LinkedIn truncates long posts and hides the rest behind a clickable
+    "…see more" link.  Expanding them before extraction gives us the full
+    post text, which improves title/company extraction accuracy.
+    """
+    try:
+        expanded = page.evaluate("""
+            () => {
+                // LinkedIn uses various patterns for "see more" buttons:
+                // - <button> with "see more" text
+                // - <a> with "see more" or "развернуть" text
+                // - spans inside buttons
+                const patterns = ['see more', 'развернуть', 'ещё', '…ещё', '...more'];
+                const clickable = [];
+                for (const el of document.querySelectorAll('button, a, span')) {
+                    const text = (el.innerText || '').trim().toLowerCase();
+                    if (patterns.some(p => text === p || text === '…' + p || text === '...' + p)) {
+                        clickable.push(el);
+                    }
+                }
+                let count = 0;
+                for (const el of clickable) {
+                    try { el.click(); count++; } catch(e) {}
+                }
+                return count;
+            }
+        """)
+        if expanded:
+            log.info("Expanded %d truncated posts", expanded)
+            page.wait_for_timeout(random.randint(1000, 2000))
+    except Exception as e:
+        log.debug("Failed to expand posts: %s", e)
 
 
 def _is_remote(text: str) -> bool:

@@ -378,7 +378,7 @@ class LinkedInPosts(Scraper):
                 launch_kwargs: dict = {
                     "channel": "chrome",
                     "headless": headless,
-                    "no_viewport": True,
+                    "viewport": {"width": 1280, "height": 900},
                 }
                 if proxy_arg:
                     launch_kwargs["proxy"] = proxy_arg
@@ -704,30 +704,80 @@ class LinkedInPosts(Scraper):
             _debug_screenshot(page, "11_no_content", "scrape")
             return []
 
-        # Scroll to load more posts (infinite scroll).
-        # LinkedIn's infinite scroll trigger is at the bottom of the results
-        # list — an IntersectionObserver fires when a sentinel element enters
-        # the viewport.  scrollBy(innerHeight) often doesn't reach it.
-        # Strategy: scroll to document bottom, wait for new content, repeat.
+        # LinkedIn SPA uses an inner scroll container (<main id="workspace">)
+        # instead of the window/body.  body has overflow:hidden so
+        # window.scrollTo() does nothing.  We dynamically find the scrollable
+        # element and scroll IT.
+        _FIND_SCROLL_CONTAINER_JS = """
+        () => {
+            // Prefer known LinkedIn container
+            const main = document.querySelector('main#workspace');
+            if (main) {
+                const s = getComputedStyle(main);
+                if ((s.overflowY === 'auto' || s.overflowY === 'scroll')
+                    && main.scrollHeight > main.clientHeight) {
+                    return '#workspace';
+                }
+            }
+            // Fallback: find any scrollable element with substantial content
+            for (const el of document.querySelectorAll('main, [role="main"], .scaffold-layout__main')) {
+                const s = getComputedStyle(el);
+                if ((s.overflowY === 'auto' || s.overflowY === 'scroll')
+                    && el.scrollHeight > el.clientHeight + 100) {
+                    return el.id ? '#' + el.id : el.tagName.toLowerCase();
+                }
+            }
+            return null;
+        }
+        """
+        container_sel = page.evaluate(_FIND_SCROLL_CONTAINER_JS)
+        use_container = container_sel is not None
+        if use_container:
+            log.info("Scroll container: %s", container_sel)
+        else:
+            log.info("No inner scroll container found — using window scroll")
+
         max_scrolls = int(os.getenv("LINKEDIN_MAX_SCROLLS", "12"))
         stale_rounds = 0
         for i in range(max_scrolls):
-            prev_len = page.evaluate("document.body.innerText.length")
-            # Scroll to bottom to trigger the infinite scroll sentinel
-            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            if use_container:
+                prev_height = page.evaluate(
+                    f"() => {{ const el = document.querySelector('{container_sel}'); "
+                    f"return el ? el.scrollHeight : 0; }}"
+                )
+                page.evaluate(
+                    f"() => {{ const el = document.querySelector('{container_sel}'); "
+                    f"if (el) el.scrollTo(0, el.scrollHeight); }}"
+                )
+            else:
+                prev_height = page.evaluate("document.body.scrollHeight")
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             # Wait for network + render (LinkedIn XHR + React hydration)
             page.wait_for_timeout(random.randint(2500, 4500))
-            # Extra wait: check if content is still loading
+            # Extra wait: check if scroll height grew (new content loaded)
             try:
-                page.wait_for_function(
-                    f"() => document.body.innerText.length > {prev_len}",
-                    timeout=5000,
-                )
+                if use_container:
+                    page.wait_for_function(
+                        f"() => {{ const el = document.querySelector('{container_sel}'); "
+                        f"return el && el.scrollHeight > {prev_height}; }}",
+                        timeout=5000,
+                    )
+                else:
+                    page.wait_for_function(
+                        f"() => document.body.scrollHeight > {prev_height}",
+                        timeout=5000,
+                    )
             except Exception:
                 pass
-            new_len = page.evaluate("document.body.innerText.length")
-            log.info("Scroll %d/%d — text length %d→%d", i + 1, max_scrolls, prev_len, new_len)
-            if new_len <= prev_len:
+            if use_container:
+                new_height = page.evaluate(
+                    f"() => {{ const el = document.querySelector('{container_sel}'); "
+                    f"return el ? el.scrollHeight : 0; }}"
+                )
+            else:
+                new_height = page.evaluate("document.body.scrollHeight")
+            log.info("Scroll %d/%d — height %d→%d", i + 1, max_scrolls, prev_height, new_height)
+            if new_height <= prev_height:
                 stale_rounds += 1
                 if stale_rounds >= 3:
                     log.info("No new content after %d stale scrolls — stopping", stale_rounds)

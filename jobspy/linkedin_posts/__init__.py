@@ -22,12 +22,14 @@ from __future__ import annotations
 
 import asyncio
 import fcntl
+import hashlib
 import json
 import logging
 import os
 import random
 import re
 from datetime import date, datetime, timedelta, timezone
+from urllib.parse import urlparse
 
 from jobspy.google.proxy_relay import ProxyRelay
 from jobspy.linkedin_posts.constant import (
@@ -184,6 +186,24 @@ _EXTRACT_POSTS_JS = """
 """
 
 
+def _add_sticky_session(proxy_url: str, account_name: str) -> str:
+    """Add DataImpulse sticky session params to proxy URL.
+
+    DataImpulse rotates residential IPs by default. LinkedIn ties sessions to
+    IP, so rotating IPs invalidate li_at cookies mid-scrape. Sticky sessions
+    pin the same IP for the TTL duration.
+
+    Format: ``username__sessid.VALUE;sessttl.MINUTES:password@host:port``
+    """
+    parsed = urlparse(proxy_url)
+    if not parsed.username:
+        return proxy_url
+    session_id = hashlib.md5(account_name.encode()).hexdigest()[:12]
+    old_user = parsed.username
+    new_user = f"{old_user}__sessid.li_{session_id};sessttl.120"
+    return proxy_url.replace(f"://{old_user}:", f"://{new_user}:", 1)
+
+
 class LinkedInPosts(Scraper):
     def __init__(
         self,
@@ -277,6 +297,12 @@ class LinkedInPosts(Scraper):
             return []
 
         headless = os.getenv("LINKEDIN_LOGIN_HEADLESS", "1") != "0"
+
+        # DataImpulse sticky session: pin the same residential IP for the
+        # entire Chrome session (login + scrape), so li_at stays valid.
+        if proxy and "dataimpulse" in proxy.lower():
+            proxy = _add_sticky_session(proxy, username)
+            log.info("DataImpulse sticky session enabled")
 
         # Proxy relay for Chromium (can't do HTTP proxy auth for HTTPS CONNECT)
         relay = None
@@ -415,16 +441,29 @@ class LinkedInPosts(Scraper):
                 ])
 
         log.info("Checking for existing LinkedIn session")
+        feed_ok = False
         try:
             page.goto(FEED_URL, wait_until="domcontentloaded", timeout=30000)
             page.wait_for_timeout(2000)
-        except Exception:
-            pass
+            feed_ok = True
+        except Exception as e:
+            log.warning("Feed navigation failed (session likely invalid): %s", e)
 
-        jar = {c["name"]: c["value"] for c in context.cookies()}
-        if "li_at" in jar and "/login" not in page.url:
-            log.info("Profile already authenticated — skipping login for %s", username)
-            return
+        if feed_ok:
+            jar = {c["name"]: c["value"] for c in context.cookies()}
+            if "li_at" in jar and "/login" not in page.url and "/checkpoint" not in page.url:
+                log.info("Profile already authenticated — skipping login for %s", username)
+                return
+
+        # Session invalid — if we injected a li_at from env, it doesn't work
+        # (likely IP mismatch: cookie from local IP used through proxy).
+        # Clear stale cookies and do a proper login through the proxy.
+        if li_at_env:
+            log.warning("Injected li_at cookie failed (IP mismatch?) — clearing, will login through proxy")
+            try:
+                context.clear_cookies()
+            except Exception:
+                pass
 
         log.info("No existing session — starting login flow for %s", username)
         _debug_screenshot(page, "01_before_login", username)

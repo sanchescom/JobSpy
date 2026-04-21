@@ -508,60 +508,35 @@ class LinkedInPosts(Scraper):
                 return
         else:
             # Standard login form: fill username.
-            # LinkedIn's React SPA sometimes renders inputs with
-            # display:contents on a parent, which Playwright's is_visible()
-            # incorrectly reports as hidden. We use count() + fill(force=True)
-            # to bypass this.
+            # LinkedIn's React SPA uses display:contents on parent divs, which
+            # makes Playwright's is_visible() return false even for fully
+            # rendered inputs. click(force=True) also fails. The reliable fix
+            # is to fill via JavaScript: use the native HTMLInputElement value
+            # setter (bypassing React's synthetic event system) then dispatch
+            # input/change events so React picks up the new value.
             log.info("Entering username")
-            username_selectors = [
+            username_filled = _js_fill_input(page, [
                 "#username",
                 'input[name="session_key"]',
                 'input[autocomplete="username"]',
                 'input[type="email"]',
                 'input[type="text"]',
-            ]
-            username_filled = False
-            for sel in username_selectors:
-                loc = page.locator(sel).first
-                try:
-                    if loc.count() > 0:
-                        loc.click(force=True, timeout=5000)
-                        page.wait_for_timeout(random.randint(200, 500))
-                        page.keyboard.type(username, delay=random.randint(30, 80))
-                        log.info("Filled username via: %s", sel)
-                        username_filled = True
-                        break
-                except Exception as e:
-                    log.debug("Selector %s failed: %s", sel, e)
-                    continue
+            ], username)
             if not username_filled:
                 _debug_screenshot(page, "ERR_no_username_input", username)
                 raise RuntimeError("Could not locate username input on LinkedIn login page")
+            log.info("Filled username via JS")
 
             page.wait_for_timeout(random.randint(300, 700))
 
-        # Fill password
+        # Fill password (same JS approach)
         log.info("Entering password")
-        password_selectors = [
+        password_filled = _js_fill_input(page, [
             "#password",
             'input[name="session_password"]',
             'input[autocomplete="current-password"]',
             'input[type="password"]',
-        ]
-        password_filled = False
-        for sel in password_selectors:
-            loc = page.locator(sel).first
-            try:
-                if loc.count() > 0:
-                    loc.click(force=True, timeout=5000)
-                    page.wait_for_timeout(random.randint(200, 500))
-                    page.keyboard.type(password, delay=random.randint(30, 80))
-                    log.info("Filled password via: %s", sel)
-                    password_filled = True
-                    break
-            except Exception as e:
-                log.debug("Password selector %s failed: %s", sel, e)
-                continue
+        ], password)
         if not password_filled:
             _debug_screenshot(page, "ERR_no_password_input", username)
             raise RuntimeError("Could not locate password input on LinkedIn login page")
@@ -819,6 +794,32 @@ class LinkedInPosts(Scraper):
         if city or country:
             return Location(city=city, country=country)
         return None
+
+
+def _js_fill_input(page, selectors: list[str], value: str) -> bool:
+    """Fill a form input using JavaScript, bypassing Playwright visibility checks.
+
+    LinkedIn's React SPA renders inputs inside ``display: contents`` parents,
+    which Playwright's actionability checks (is_visible, click) incorrectly
+    treat as hidden.  This function uses the native HTMLInputElement value
+    setter + dispatching input/change events so React picks up the change.
+    """
+    css = ", ".join(selectors)
+    return page.evaluate(
+        """([css, value]) => {
+            const el = document.querySelector(css);
+            if (!el) return false;
+            el.focus();
+            const setter = Object.getOwnPropertyDescriptor(
+                window.HTMLInputElement.prototype, 'value'
+            ).set;
+            setter.call(el, value);
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+            return true;
+        }""",
+        [css, value],
+    )
 
 
 def _is_remote(text: str) -> bool:

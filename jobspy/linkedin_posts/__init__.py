@@ -510,11 +510,14 @@ class LinkedInPosts(Scraper):
             # Standard login form: fill username.
             # LinkedIn's React SPA uses display:contents on parent divs, which
             # makes Playwright's is_visible() return false even for fully
-            # rendered inputs. click(force=True) also fails. The reliable fix
-            # is to fill via JavaScript: use the native HTMLInputElement value
-            # setter (bypassing React's synthetic event system) then dispatch
+            # rendered inputs. The reliable fix is to fill via JavaScript:
+            # use the native HTMLInputElement value setter then dispatch
             # input/change events so React picks up the new value.
-            log.info("Entering username")
+            #
+            # LinkedIn uses a TWO-STEP login flow: email first, then password
+            # on a second page. We must submit email, wait for step 2, then
+            # fill password.
+            log.info("Entering username (step 1)")
             username_filled = _js_fill_input(page, [
                 "#username",
                 'input[name="session_key"]',
@@ -529,7 +532,34 @@ class LinkedInPosts(Scraper):
 
             page.wait_for_timeout(random.randint(300, 700))
 
-        # Fill password (same JS approach)
+            # Check if password field is already visible (old-style single-page login)
+            has_password_now = page.evaluate(
+                "() => { const el = document.querySelector('#password, input[type=\"password\"]'); "
+                "return el && el.offsetHeight > 0; }"
+            )
+
+            if not has_password_now:
+                # Two-step login: submit email first, wait for password step
+                log.info("Two-step login detected — submitting email first")
+                page.keyboard.press("Enter")
+                page.wait_for_timeout(random.randint(2000, 4000))
+                _debug_screenshot(page, "02c_after_email_submit", username)
+
+                # Wait for password field to appear (up to 10s)
+                try:
+                    page.wait_for_function(
+                        "() => !!document.querySelector('#password, input[type=\"password\"]')",
+                        timeout=10000,
+                    )
+                except Exception:
+                    _debug_screenshot(page, "ERR_no_password_step", username)
+                    raise RuntimeError(
+                        "Password step didn't appear after email submission. "
+                        f"URL: {page.url}"
+                    )
+                page.wait_for_timeout(random.randint(500, 1000))
+
+        # Fill password (JS approach — same React visibility workaround)
         log.info("Entering password")
         password_filled = _js_fill_input(page, [
             "#password",
@@ -544,7 +574,7 @@ class LinkedInPosts(Scraper):
         page.wait_for_timeout(random.randint(300, 700))
         _debug_screenshot(page, "03_credentials_entered", username)
 
-        # Submit
+        # Submit password
         page.keyboard.press("Enter")
         log.info("Submitted login form")
         page.wait_for_timeout(random.randint(3000, 5000))

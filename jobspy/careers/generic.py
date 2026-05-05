@@ -182,8 +182,80 @@ class GenericCareerParser(BaseATSParser):
 
         if len(jobs) >= 2:
             logger.info("Generic (sitemap): %d jobs from %s", len(jobs), career_url)
+            self._enrich_jobs(jobs)
             return jobs
         return []
+
+    def _enrich_jobs(self, jobs: list[JobPost], max_fetch: int = 50) -> None:
+        """Fetch individual job pages to fill in missing descriptions.
+
+        Only fetches up to max_fetch pages to avoid hammering the server.
+        Jobs that already have descriptions are skipped.
+        """
+        import time
+
+        to_enrich = [j for j in jobs if not j.description]
+        if not to_enrich:
+            return
+
+        enriched = 0
+        for job in to_enrich[:max_fetch]:
+            try:
+                resp = self.session.get(job.job_url, timeout=20)
+                if not resp.ok:
+                    continue
+                html = resp.text
+
+                desc = self._extract_description_from_html(html)
+                if desc:
+                    job.description = desc
+                    enriched += 1
+
+                time.sleep(0.5)
+            except Exception:
+                continue
+
+        if enriched:
+            logger.info("Generic: enriched %d/%d jobs with descriptions", enriched, len(to_enrich[:max_fetch]))
+
+    def _extract_description_from_html(self, html: str) -> str | None:
+        """Extract job description from a single job page via JSON-LD or meta tags."""
+        # Try JSON-LD first
+        pattern = re.compile(
+            r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+            re.DOTALL | re.IGNORECASE,
+        )
+        for match in pattern.finditer(html):
+            try:
+                data = json.loads(match.group(1).strip())
+            except json.JSONDecodeError:
+                continue
+
+            postings = self._find_job_postings(data)
+            for jp in postings:
+                desc = jp.get("description", "")
+                if desc:
+                    if "<" in desc:
+                        desc = markdown_converter(desc)
+                    if len(desc) > 50:
+                        return desc
+
+        # Try og:description / meta description
+        og_match = re.search(
+            r'<meta[^>]+property=["\']og:description["\'][^>]+content=["\']([^"\']{50,})["\']',
+            html, re.IGNORECASE,
+        )
+        if og_match:
+            return og_match.group(1).strip()
+
+        meta_match = re.search(
+            r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']{50,})["\']',
+            html, re.IGNORECASE,
+        )
+        if meta_match:
+            return meta_match.group(1).strip()
+
+        return None
 
     def _fetch_sitemap_jobs(
         self, sitemap_url: str, base: str, depth: int
@@ -353,6 +425,7 @@ class GenericCareerParser(BaseATSParser):
                     jobs = _extract_job_links(page, career_url, company_name)
                     if jobs:
                         logger.info("Generic (links): %d jobs from %s", len(jobs), career_url)
+                        self._enrich_jobs(jobs)
                         return jobs
 
                     # Strategy 4: Follow "all jobs" link and retry
@@ -379,6 +452,7 @@ class GenericCareerParser(BaseATSParser):
                         jobs = _extract_job_links(page, jobs_url, company_name)
                         if jobs:
                             logger.info("Generic (links after nav): %d jobs from %s", len(jobs), jobs_url)
+                            self._enrich_jobs(jobs)
                             return jobs
 
                     return []
@@ -880,13 +954,17 @@ _CATEGORY_EXACT = re.compile(
     r'|about|faq|students?|campus|intern(?:ship)?s?|inclusion|diversity|values'
     r'|search|results|all-jobs|open-roles|blog|stories?|news|press'
     r'|principles?|extraordinary|university|people|mission|impact'
-    r'|sustainability|contact|login|sign-?up|apply-?now|subscribe|newsletter)'
+    r'|sustainability|contacts?|login|sign-?up|apply-?now|subscribe|newsletter'
+    r'|articles?|authors?|shares|events?|guides?|resources?|policies?|privacy'
+    r'|terms|cookies?|legal|employee-stories|candidate-guidance|class-of'
+    r'|profiles?|partners?|clients?|portfolio|services?|solutions?'
+    r'|category|tags?|archives?|page|feed|sitemap|media)'
     r'(?:/|$|\?)',
     re.IGNORECASE,
 )
 # Prefix patterns (match start of path segment)
 _CATEGORY_PREFIX = re.compile(
-    r'/(?:life-at|why-|how-we|our-|how-to|work-at)',
+    r'/(?:life-at|why-|how-we|our-|how-to|work-at|meet-|jobs-in-|jobs-near-)',
     re.IGNORECASE,
 )
 

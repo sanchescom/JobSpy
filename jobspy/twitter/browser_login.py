@@ -40,8 +40,17 @@ class BrowserLoginError(Exception):
 
 
 def _dismiss_cookie_banner(page) -> None:
-    """Click 'Refuse non-essential cookies' on the EU consent banner if shown."""
-    for text in ("Refuse non-essential cookies", "Accept all cookies"):
+    """Click 'Refuse non-essential cookies' on the EU consent banner if shown.
+
+    The banner can appear in the IP's locale (e.g. German on a DE residential
+    proxy), so match a few language variants.
+    """
+    for text in (
+        "Refuse non-essential cookies",
+        "Accept all cookies",
+        "Nicht notwendige Cookies ablehnen",
+        "Alle Cookies akzeptieren",
+    ):
         try:
             btn = page.get_by_role("button", name=text, exact=False).first
             if btn.count() > 0 and btn.is_visible():
@@ -51,6 +60,15 @@ def _dismiss_cookie_banner(page) -> None:
                 return
         except Exception:
             continue
+
+
+def _page_has_text(page, needles: list[str]) -> bool:
+    """True if any needle appears in the page's visible text (case-insensitive)."""
+    try:
+        body = (page.inner_text("body") or "").lower()
+    except Exception:
+        return False
+    return any(n.lower() in body for n in needles)
 
 
 _FOCUS_ON_TOP_JS = """
@@ -411,14 +429,36 @@ def ensure_logged_in(
         raise BrowserLoginError("Could not locate visible username input in modal")
     _debug_screenshot(page, "02a_after_typing_username", username)
 
-    # Advance to the password step. Enter submits the email form directly;
-    # only if that doesn't reveal the password do we click the form's exact
-    # "Continue" (NOT the "Continue with phone/Google/Apple" social buttons).
-    page.keyboard.press("Enter")
-    page.wait_for_timeout(random.randint(2000, 3500))
-    if not _focus_visible_input(page, _PASSWORD_SELECTORS, timeout_ms=2500):
-        _click_button(page, ["Next", "Continue", "Log in"], timeout_ms=3000)
+    # Advance to the password step. X sometimes returns a transient
+    # "Something went wrong, please try again!" after submitting the username
+    # (more common through rotating residential IPs) — retry the submit a few
+    # times. Submit via Enter (locale-independent; the button reads "Weiter"
+    # etc. on geo-localised UIs). Dismiss the late cookie-consent banner each
+    # round since it can overlay the form.
+    for attempt in range(4):
+        _dismiss_cookie_banner(page)
+        page.keyboard.press("Enter")
         page.wait_for_timeout(random.randint(2000, 3500))
+        if _focus_visible_input(page, _PASSWORD_SELECTORS, timeout_ms=3000):
+            break  # password step reached
+        # alt-identifier or verification challenge also counts as progress
+        if _focus_visible_input(
+            page, ['input[data-testid="ocfEnterTextTextInput"]'], timeout_ms=1500
+        ):
+            break
+        if _page_has_text(page, ["temporarily limited your login"]):
+            _debug_screenshot(page, "ERR_login_limited", username)
+            raise BrowserLoginError(
+                "X temporarily limited this login (IP reputation) — "
+                "use a residential proxy or seed auth_token/ct0 cookies"
+            )
+        if _page_has_text(page, ["Something went wrong", "try again"]):
+            log.info("Transient 'something went wrong' — retrying (%d)", attempt + 1)
+            page.wait_for_timeout(random.randint(1500, 3000))
+            continue
+        # nothing recognizable yet — give it one nudge via the form button
+        _click_button(page, ["Next", "Continue", "Log in", "Weiter"], timeout_ms=2500)
+        page.wait_for_timeout(random.randint(1500, 3000))
     _debug_screenshot(page, "02b_after_username_submit", username)
 
     # Legacy alt-identifier challenge (email/phone) before password.

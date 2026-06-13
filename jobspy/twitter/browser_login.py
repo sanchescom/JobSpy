@@ -109,6 +109,64 @@ def _type_into_focused(page, text: str) -> None:
         page.wait_for_timeout(random.randint(40, 130))
 
 
+def _type_into_field(page, selectors: list[str], text: str, timeout_ms: int = 30000) -> bool:
+    """Focus the first visible input matching any selector and type into it.
+
+    Uses Playwright's native locator API (scroll-into-view + actionability)
+    instead of elementFromPoint, which breaks when the field sits below a short
+    headless viewport. Types char-by-char so X's React/anti-bot sees real keys.
+    """
+    import time as _t
+
+    deadline = _t.time() + timeout_ms / 1000
+    while _t.time() < deadline:
+        for sel in selectors:
+            loc = page.locator(sel)
+            try:
+                count = loc.count()
+            except Exception:
+                count = 0
+            for i in range(count):
+                el = loc.nth(i)
+                try:
+                    if not el.is_visible():
+                        continue
+                    el.scroll_into_view_if_needed(timeout=3000)
+                    el.click(timeout=3000)
+                    page.wait_for_timeout(random.randint(150, 400))
+                    _type_into_focused(page, text)
+                    return True
+                except Exception:
+                    continue
+        page.wait_for_timeout(400)
+    return False
+
+
+def _click_button(page, names: list[str], timeout_ms: int = 4000, exact: bool = True) -> bool:
+    """Click the first visible button whose accessible name matches.
+
+    Defaults to exact matching: a fuzzy "Continue" would also hit
+    "Continue with phone"/"Continue with Google" on X's login chooser.
+    """
+    import time as _t
+
+    deadline = _t.time() + timeout_ms / 1000
+    while _t.time() < deadline:
+        for name in names:
+            try:
+                loc = page.get_by_role("button", name=name, exact=exact)
+                for i in range(loc.count()):
+                    btn = loc.nth(i)
+                    if btn.is_visible():
+                        btn.scroll_into_view_if_needed(timeout=2000)
+                        btn.click(timeout=2000)
+                        return True
+            except Exception:
+                continue
+        page.wait_for_timeout(300)
+    return False
+
+
 def _get_email_code(
     email: str, email_password: str, min_t: datetime, timeout: int = 90
 ) -> str | None:
@@ -165,6 +223,259 @@ def _debug_screenshot(page, step: str, username: str) -> None:
         pass
 
 
+def _read_x_cookies(context) -> dict[str, str]:
+    return {
+        c["name"]: c["value"]
+        for c in context.cookies()
+        if c.get("domain", "").endswith("x.com")
+        or c.get("domain", "").endswith("twitter.com")
+    }
+
+
+def _submit_email_code_if_challenged(
+    page,
+    context,
+    username: str,
+    email: str | None,
+    email_password: str | None,
+    submit_time: datetime,
+) -> None:
+    """Handle the post-credential email-verification / re-confirm-email steps.
+
+    Shared by both the new single-page login form and the legacy modal flow.
+    No-op when X doesn't raise a challenge.
+    """
+
+    def _ocf_mode() -> str | None:
+        try:
+            return page.evaluate(
+                """() => {
+                    const el = document.querySelector('input[data-testid="ocfEnterTextTextInput"]');
+                    if (!el) return null;
+                    return el.getAttribute('inputmode') || el.type || 'text';
+                }"""
+            )
+        except Exception:
+            return None
+
+    if not _focus_visible_input(
+        page, ['input[data-testid="ocfEnterTextTextInput"]'], timeout_ms=4000
+    ):
+        return  # no challenge
+
+    mode = _ocf_mode()
+    log.info(f"Post-password challenge detected (inputmode={mode})")
+
+    # "Re-enter your email" step (non-numeric) before the code is sent.
+    if mode != "numeric" and email:
+        log.info("Auto-filling email for confirmation step")
+        page.wait_for_timeout(random.randint(200, 500))
+        _type_into_focused(page, email)
+        page.wait_for_timeout(random.randint(500, 1200))
+        page.keyboard.press("Enter")
+        page.wait_for_timeout(random.randint(2500, 4500))
+        _focus_visible_input(
+            page, ['input[data-testid="ocfEnterTextTextInput"]'], timeout_ms=10000
+        )
+        mode = _ocf_mode()
+        log.info(f"After email confirm, inputmode={mode}")
+
+    manual = os.getenv("TWITTER_LOGIN_MANUAL_CODE") == "1"
+    if manual:
+        wait_s = int(os.getenv("TWITTER_LOGIN_MANUAL_TIMEOUT", "300"))
+        log.info(f"Manual code entry mode — waiting up to {wait_s}s for auth_token...")
+        deadline = datetime.now(timezone.utc).timestamp() + wait_s
+        while datetime.now(timezone.utc).timestamp() < deadline:
+            if "auth_token" in _read_x_cookies(context):
+                log.info("Challenge cleared (auth_token appeared)")
+                return
+            page.wait_for_timeout(1000)
+        return
+
+    if not (email and email_password):
+        raise BrowserLoginError(
+            "Twitter requested email verification but no email/email_password configured "
+            "(or set TWITTER_LOGIN_MANUAL_CODE=1 for manual entry)"
+        )
+    code = _get_email_code(email, email_password, submit_time, timeout=90)
+    if not code:
+        raise BrowserLoginError("Failed to retrieve email verification code from IMAP")
+    log.info(f"Submitting verification code: {code[:2]}***")
+    _focus_visible_input(
+        page, ['input[data-testid="ocfEnterTextTextInput"]'], timeout_ms=5000
+    )
+    page.wait_for_timeout(random.randint(200, 500))
+    _type_into_focused(page, code)
+    page.wait_for_timeout(random.randint(500, 1200))
+    page.keyboard.press("Enter")
+    page.wait_for_timeout(random.randint(3000, 6000))
+
+
+# Username field selectors — new single-page form uses name="username_or_email";
+# the legacy modal used autocomplete="username" / name="text".
+_USERNAME_SELECTORS = [
+    'input[name="username_or_email"]',
+    'input[autocomplete="username"]',
+    'input[autocomplete*="username"]',
+    'input[name="text"]',
+]
+_PASSWORD_SELECTORS = [
+    'input[name="password"]',
+    'input[autocomplete="current-password"]',
+    'input[type="password"]',
+]
+
+
+def _inject_seed_cookies(context, auth_token: str, ct0: str) -> None:
+    """Seed auth_token + ct0 into the context so X treats it as logged in.
+
+    Lets a session captured on a clean (residential) IP be reused on the
+    server, sidestepping X's "we've temporarily limited your login" block on
+    datacenter IPs. Cookies are set for both x.com and twitter.com.
+    """
+    cookies = []
+    for domain in (".x.com", ".twitter.com"):
+        cookies.append({"name": "auth_token", "value": auth_token, "domain": domain,
+                        "path": "/", "secure": True, "httpOnly": True})
+        cookies.append({"name": "ct0", "value": ct0, "domain": domain,
+                        "path": "/", "secure": True})
+    context.add_cookies(cookies)
+
+
+def ensure_logged_in(
+    context,
+    page,
+    username: str,
+    password: str,
+    email: str | None = None,
+    email_password: str | None = None,
+    auth_token: str | None = None,
+    ct0: str | None = None,
+) -> dict[str, str]:
+    """Ensure ``page``'s context holds a logged-in X session; return x.com cookies.
+
+    Operates on an already-open persistent context so the caller can keep the
+    session for DOM scraping. Establishes the session by, in order:
+      * fast-path: profile already authenticated (auth_token + ct0 present)
+      * seeded cookies (auth_token/ct0 passed in or via TWITTER_AUTH_TOKEN /
+        TWITTER_CT0 env) — survives X's datacenter-IP login block
+      * new single-page credential form (username/email + password)
+      * legacy multi-step modal (username -> Enter -> [email] -> password)
+
+    Raises :class:`BrowserLoginError` if no valid session can be established.
+    """
+    # --- Fast-path: existing session in the persistent profile ---
+    log.info("Checking for an existing authenticated session")
+    try:
+        page.goto("https://x.com/home", wait_until="domcontentloaded", timeout=30000)
+        page.wait_for_timeout(2000)
+    except Exception:
+        pass
+    jar = _read_x_cookies(context)
+    if "auth_token" in jar and "ct0" in jar and "login" not in page.url:
+        log.info(f"Profile already authenticated — skipping login flow for {username}")
+        return jar
+
+    # --- Seeded-cookie path: reuse a session captured elsewhere ---
+    auth_token = auth_token or os.getenv("TWITTER_AUTH_TOKEN")
+    ct0 = ct0 or os.getenv("TWITTER_CT0")
+    if auth_token and ct0:
+        log.info("Seeding auth_token/ct0 cookies for %s", username)
+        _inject_seed_cookies(context, auth_token, ct0)
+        try:
+            page.goto("https://x.com/home", wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_timeout(2000)
+        except Exception:
+            pass
+        jar = _read_x_cookies(context)
+        if "auth_token" in jar and "login" not in page.url:
+            log.info(f"Seeded session accepted for {username}")
+            return jar
+        log.warning("Seeded cookies did not yield a valid session — falling back to login")
+
+    # --- Need to log in ---
+    log.info(f"No existing session — starting login flow for {username}")
+    page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
+    try:
+        page.wait_for_load_state("networkidle", timeout=15000)
+    except Exception:
+        pass
+    page.wait_for_timeout(random.randint(2000, 3500))
+    _dismiss_cookie_banner(page)
+    _debug_screenshot(page, "01_loaded", username)
+
+    # Step 1: username/email
+    log.info("Entering username")
+    if not _type_into_field(page, _USERNAME_SELECTORS, username, timeout_ms=45000):
+        _debug_screenshot(page, "ERR_no_username_input", username)
+        raise BrowserLoginError("Could not locate visible username input in modal")
+    _debug_screenshot(page, "02a_after_typing_username", username)
+
+    # Advance to the password step. Enter submits the email form directly;
+    # only if that doesn't reveal the password do we click the form's exact
+    # "Continue" (NOT the "Continue with phone/Google/Apple" social buttons).
+    page.keyboard.press("Enter")
+    page.wait_for_timeout(random.randint(2000, 3500))
+    if not _focus_visible_input(page, _PASSWORD_SELECTORS, timeout_ms=2500):
+        _click_button(page, ["Next", "Continue", "Log in"], timeout_ms=3000)
+        page.wait_for_timeout(random.randint(2000, 3500))
+    _debug_screenshot(page, "02b_after_username_submit", username)
+
+    # Legacy alt-identifier challenge (email/phone) before password.
+    if _focus_visible_input(
+        page, ['input[data-testid="ocfEnterTextTextInput"]'], timeout_ms=3000
+    ):
+        log.info("Alt-identifier challenge: entering email")
+        page.wait_for_timeout(random.randint(200, 500))
+        _type_into_focused(page, email or username)
+        page.wait_for_timeout(random.randint(500, 1200))
+        page.keyboard.press("Enter")
+        page.wait_for_timeout(random.randint(2500, 4500))
+        _debug_screenshot(page, "03_after_alt", username)
+
+    # Step 2: password
+    log.info("Entering password")
+    if not _type_into_field(page, _PASSWORD_SELECTORS, password, timeout_ms=45000):
+        _debug_screenshot(page, "ERR_no_password_input", username)
+        raise BrowserLoginError("Could not locate visible password input in modal")
+    submit_time = datetime.now(timezone.utc)
+    page.keyboard.press("Enter")
+    page.wait_for_timeout(random.randint(1500, 2500))
+    if "auth_token" not in _read_x_cookies(context):
+        _click_button(page, ["Log in", "Continue"], timeout_ms=3000)
+    page.wait_for_timeout(random.randint(3000, 6000))
+    _debug_screenshot(page, "04_after_password", username)
+
+    # Step 3: optional email-verification challenge
+    _submit_email_code_if_challenged(
+        page, context, username, email, email_password, submit_time
+    )
+    _debug_screenshot(page, "05_after_verification", username)
+
+    # Step 4: wait for the session to settle
+    log.info("Waiting for login to settle")
+    for _ in range(30):
+        if "auth_token" in _read_x_cookies(context):
+            break
+        url = page.url
+        if "/home" in url or url.rstrip("/") in (
+            "https://x.com",
+            "https://twitter.com",
+        ):
+            break
+        page.wait_for_timeout(1000)
+
+    jar = _read_x_cookies(context)
+    if "auth_token" not in jar or "ct0" not in jar:
+        _debug_screenshot(page, "99_final_missing_cookies", username)
+        raise BrowserLoginError(
+            f"Login did not produce auth_token/ct0. "
+            f"Cookies: {sorted(jar.keys())}. URL: {page.url}"
+        )
+    log.info(f"Successfully authenticated {username}")
+    return jar
+
+
 def login_via_browser(
     username: str,
     password: str,
@@ -179,6 +490,10 @@ def login_via_browser(
 
     Returns a dict containing at minimum ``auth_token`` and ``ct0``.
     Raises :class:`BrowserLoginError` on any failure.
+
+    Thin wrapper around :func:`ensure_logged_in` that owns the browser lifecycle
+    and returns cookies (legacy twscrape-cookie path). The DOM scraper calls
+    :func:`open_authenticated_context` instead so it can reuse the live session.
     """
     # Patchright is a drop-in Playwright fork that patches the CDP/runtime
     # signals x.com fingerprints. Stock Playwright (even with stealth patches)
@@ -237,6 +552,10 @@ def login_via_browser(
                 # — those are the two strongest fingerprint leaks. Let Chrome
                 # report its own real values.
                 "no_viewport": True,
+                # ...but the default headless window is only ~800x600, which
+                # pushes the login fields below the fold and breaks visibility
+                # checks. Give Chrome a real, tall window via a launch arg.
+                "args": ["--window-size=1280,1024"],
             }
             if proxy_arg:
                 launch_kwargs["proxy"] = proxy_arg
@@ -244,30 +563,15 @@ def login_via_browser(
             log.info(f"Launching {lib_name} persistent context at {user_data_dir}")
             context = p.chromium.launch_persistent_context(user_data_dir, **launch_kwargs)
             try:
-                # Persistent context auto-creates a page; reuse it.
                 page = context.pages[0] if context.pages else context.new_page()
-
-                # Fast-path: if the persistent profile already has a valid
-                # session, navigating to x.com/home will succeed without
-                # redirecting to /i/flow/login. In that case we just read
-                # auth_token + ct0 and skip the entire login flow.
-                log.info("Checking for an existing authenticated session")
-                try:
-                    page.goto("https://x.com/home", wait_until="domcontentloaded", timeout=30000)
-                    page.wait_for_timeout(2000)
-                except Exception:
-                    pass
-
-                jar = {c["name"]: c["value"] for c in context.cookies()}
-                if "auth_token" in jar and "ct0" in jar and "i/flow/login" not in page.url:
-                    log.info(f"Profile already authenticated — skipping login flow for {username}")
-                    cookie_map = {
-                        c["name"]: c["value"]
-                        for c in context.cookies()
-                        if c.get("domain", "").endswith("x.com")
-                        or c.get("domain", "").endswith("twitter.com")
-                    }
-                    return cookie_map
+                return ensure_logged_in(
+                    context,
+                    page,
+                    username,
+                    password,
+                    email=email or None,
+                    email_password=email_password or None,
+                )
 
                 log.info(f"No existing session — starting login flow for {username}")
                 log.info(f"Navigating to {LOGIN_URL} for {username}")

@@ -113,11 +113,12 @@ class IrishJobs(Scraper):
 
     def _scrape_with_playwright(self) -> JobResponse:
         try:
-            from playwright.sync_api import sync_playwright
+            # patchright (stealth Playwright): vanilla Playwright gets detected by
+            # irishjobs.ie's StepStone/Cloudflare bot protection and the render
+            # fails → HTTP fallback hangs. patchright renders reliably (25 cards).
+            from patchright.sync_api import sync_playwright
         except ImportError:
-            raise RuntimeError(
-                "playwright is not installed – run: pip install playwright && playwright install chromium"
-            )
+            from playwright.sync_api import sync_playwright
 
         job_list: list[JobPost] = []
 

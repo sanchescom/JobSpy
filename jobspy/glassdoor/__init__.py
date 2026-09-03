@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import json
 import requests
+from curl_cffi import requests as curl_requests
 from typing import Tuple
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -50,6 +51,17 @@ class Glassdoor(Scraper):
         self.max_pages = 30
         self.seen_urls = set()
 
+    def _make_session(self):
+        """curl_cffi session with Chrome impersonation — required to pass
+        Glassdoor's WAF (plain requests / tls_client get 400/403). Each new
+        session gets a fresh proxy IP on rotating gateways."""
+        proxy = self.proxies[0] if isinstance(self.proxies, (list, tuple)) and self.proxies else self.proxies
+        proxies = {"http": proxy, "https": proxy} if isinstance(proxy, str) else None
+        session = curl_requests.Session(impersonate="chrome", proxies=proxies)
+        if getattr(self, "_prepared_headers", None):
+            session.headers.update(self._prepared_headers)
+        return session
+
     def scrape(self, scraper_input: ScraperInput) -> JobResponse:
         """
         Scrapes Glassdoor for jobs with scraper_input criteria.
@@ -60,13 +72,16 @@ class Glassdoor(Scraper):
         self.scraper_input.results_wanted = min(900, scraper_input.results_wanted)
         self.base_url = self.scraper_input.country.get_glassdoor_url()
 
-        self.session = create_session(
-            proxies=self.proxies, ca_cert=self.ca_cert, has_retry=True
-        )
+        # Glassdoor's WAF now blocks tls_client's fingerprint (400/403) for all
+        # client identifiers — only curl_cffi's browser impersonation gets
+        # through. Use it for every Glassdoor request.
+        self.session = self._make_session()
         token = self._get_csrf_token()
         headers["gd-csrf-token"] = token if token else fallback_token
         if self.user_agent:
             headers["user-agent"] = self.user_agent
+        # Remember prepared headers so rotated sessions (IP retries) stay consistent.
+        self._prepared_headers = dict(headers)
         self.session.headers.update(headers)
 
         location_id, location_type = self._get_location(
@@ -138,8 +153,8 @@ class Glassdoor(Scraper):
         try:
             payload = self._add_payload(location_id, location_type, page_num, cursor, employer_id=employer_id)
             response = self.session.post(
-                f"{self.base_url}/graph",
-                timeout_seconds=15,
+                f"{self.base_url.rstrip(chr(47))}/graph",
+                timeout=15,
                 data=payload,
             )
             if response.status_code != 200:
@@ -264,7 +279,7 @@ class Glassdoor(Scraper):
         """
         Fetches the job description for a single job ID.
         """
-        url = f"{self.base_url}/graph"
+        url = f"{self.base_url.rstrip(chr(47))}/graph"
         body = [
             {
                 "operationName": "JobDetailQuery",
@@ -289,7 +304,11 @@ class Glassdoor(Scraper):
                 """,
             }
         ]
-        res = self.session.post(url, json=body)
+        # Own session: _process_job runs in a thread pool and curl_cffi
+        # sessions aren't safe to share across concurrent requests.
+        sess = self._make_session()
+        sess.headers.update(dict(self.session.headers))
+        res = sess.post(url, json=body, timeout=15)
         if res.status_code != 200:
             log.warning(f"Description fetch returned {res.status_code} for job {job_id}")
             return None
@@ -302,19 +321,30 @@ class Glassdoor(Scraper):
     def _get_location(self, location: str, is_remote: bool) -> (int, str):
         if not location or is_remote:
             return "11047", "STATE"  # remote options
-        url = f"{self.base_url}/findPopularLocationAjax.htm?maxLocationsToReturn=10&term={location}"
-        res = self.session.get(url)
-        if res.status_code != 200:
+        # base_url has a trailing slash — don't double it, Glassdoor's WAF 403s "//"
+        url = f"{self.base_url.rstrip('/')}/findPopularLocationAjax.htm?maxLocationsToReturn=10&term={location}"
+        # Glassdoor's WAF flags a fraction of proxy IPs (400/403). Retry with a
+        # fresh session (new IP on a rotating gateway) until one gets through.
+        items = None
+        for attempt in range(6):
+            res = self.session.get(url)
             if res.status_code == 429:
-                err = f"429 Response - Blocked by Glassdoor for too many requests"
-                log.error(err)
+                log.error("429 Response - Blocked by Glassdoor for too many requests")
                 return None, None
-            else:
-                err = f"Glassdoor response status code {res.status_code}"
-                err += f" - {res.text}"
-                log.error(f"Glassdoor response status code {res.status_code}")
-                return None, None
-        items = res.json()
+            if res.status_code == 200:
+                try:
+                    items = res.json()
+                    break
+                except Exception:
+                    pass  # HTML/garbage body — treat as a blocked IP, rotate
+            log.warning(
+                "Glassdoor location lookup got %s (attempt %d/6), rotating IP",
+                res.status_code, attempt + 1,
+            )
+            self.session = self._make_session()
+        if items is None:
+            log.error("Glassdoor: location lookup failed after retries")
+            return None, None
 
         if not items:
             raise ValueError(f"Location '{location}' not found on Glassdoor")

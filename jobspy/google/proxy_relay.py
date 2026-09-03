@@ -35,6 +35,7 @@ class ProxyRelay:
         self._thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._server = None
+        self._tasks: set[asyncio.Task] = set()
 
     @staticmethod
     def _find_free_port() -> int:
@@ -53,22 +54,54 @@ class ProxyRelay:
                 break
 
     def stop(self) -> None:
+        """Shut down cleanly: cancel in-flight tunnels, stop the loop, join the thread.
+
+        The previous implementation only closed the listening socket and abandoned
+        the loop with pending tasks, leaking sockets/threads and spamming
+        "Task was destroyed but it is pending!" on GC.
+        """
         if self._loop and self._server:
-            self._loop.call_soon_threadsafe(self._server.close)
-        # Don't join — daemon thread will die with process
+            self._loop.call_soon_threadsafe(self._shutdown)
+        if self._thread:
+            self._thread.join(timeout=5)
+
+    def _shutdown(self) -> None:
+        """Cancel all pending tasks and stop the event loop (runs on the loop)."""
+        self._server.close()
+        for task in self._tasks:
+            task.cancel()
+        self._tasks.clear()
+        self._loop.stop()
 
     def _run(self) -> None:
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
-        self._loop.run_until_complete(self._serve())
+        try:
+            self._loop.run_until_complete(self._serve())
+        except RuntimeError:
+            pass  # "Event loop stopped before Future completed" — expected on shutdown
+        finally:
+            # Cancel any remaining tasks so their sockets close now, not at GC
+            for task in asyncio.all_tasks(self._loop):
+                task.cancel()
+            self._loop.run_until_complete(self._loop.shutdown_asyncgens())
+            self._loop.close()
 
     async def _serve(self) -> None:
         self._server = await asyncio.start_server(
-            self._handle_client, self.host, self.port
+            self._on_client, self.host, self.port
         )
         log.debug(f"Proxy relay listening on {self.host}:{self.port}")
         async with self._server:
             await self._server.serve_forever()
+
+    def _on_client(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        """Callback wrapper that tracks tasks for clean shutdown."""
+        task = self._loop.create_task(self._handle_client(reader, writer))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
 
     async def _handle_client(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -126,7 +159,7 @@ class ProxyRelay:
                     self._pipe(up_reader, writer),
                 )
 
-        except Exception:
+        except (Exception, asyncio.CancelledError):
             pass
         finally:
             try:
@@ -150,5 +183,5 @@ class ProxyRelay:
                     break
                 writer.write(data)
                 await writer.drain()
-        except Exception:
+        except (Exception, asyncio.CancelledError):
             pass

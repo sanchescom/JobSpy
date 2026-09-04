@@ -23,7 +23,7 @@ from jobspy.util import (
     extract_emails_from_text,
     markdown_converter,
 )
-from jobspy.irishjobs.constant import BASE_URL, SEARCH_URL, SELECTORS
+from jobspy.irishjobs.constant import BASE_URL, SEARCH_URL, SELECTORS, headers
 from jobspy.irishjobs.util import (
     log,
     parse_salary,
@@ -62,11 +62,19 @@ class IrishJobs(Scraper):
     def scrape(self, scraper_input: ScraperInput) -> JobResponse:
         self.scraper_input = scraper_input
 
+        # irishjobs.ie serves full SSR job data in the HTML and bans datacenter
+        # IPs at the network level — so the HTTP path through a rotating
+        # residential proxy is the reliable route (no browser needed). The
+        # browser path is a last resort (and needs a proxy relay to work through
+        # an authenticated proxy anyway).
+        result = self._scrape_with_http()
+        if result.jobs:
+            return result
         try:
             return self._scrape_with_playwright()
         except Exception as e:
-            log.warning(f"Playwright scrape failed ({e}), falling back to HTTP")
-            return self._scrape_with_http()
+            log.warning(f"Playwright fallback failed ({e})")
+            return result
 
     # ── Playwright path ───────────────────────────────────────────
 
@@ -200,25 +208,32 @@ class IrishJobs(Scraper):
     # ── HTTP fallback ─────────────────────────────────────────────
 
     def _scrape_with_http(self) -> JobResponse:
-        """Fallback: try HTTP request and parse whatever SSR content is available."""
-        session = create_session(
-            proxies=self.proxies, ca_cert=self.ca_cert, is_tls=False, has_retry=True, delay=3
-        )
-
+        """Primary path: fetch the SSR search page and parse it. irishjobs.ie
+        flags a fraction of proxy IPs (403/SSL), so retry with a fresh session
+        (new IP on a rotating residential gateway) until one returns 200."""
         job_list: list[JobPost] = []
         current_page = 1
 
         while len(job_list) < self.scraper_input.results_wanted:
             url = self._build_search_url(page=current_page)
-            log.info(f"HTTP fallback - fetching page {current_page}: {url}")
+            log.info(f"HTTP - fetching page {current_page}: {url}")
 
-            try:
-                response = session.get(url, timeout=30)
-                if response.status_code != 200:
-                    log.warning(f"HTTP {response.status_code} for {url}")
-                    break
-            except Exception as e:
-                log.error(f"HTTP request failed: {e}")
+            response = None
+            for attempt in range(6):
+                session = create_session(
+                    proxies=self.proxies, ca_cert=self.ca_cert, is_tls=False, has_retry=False
+                )
+                session.headers.update(headers)  # browser UA — default requests UA is blocked
+                try:
+                    resp = session.get(url, timeout=30)
+                    if resp.status_code == 200:
+                        response = resp
+                        break
+                    log.warning(f"IrishJobs HTTP {resp.status_code} (attempt {attempt+1}/6), rotating IP")
+                except Exception as e:
+                    log.warning(f"IrishJobs fetch {type(e).__name__} (attempt {attempt+1}/6), rotating IP")
+            if response is None:
+                log.error("IrishJobs: no 200 after retries")
                 break
 
             jobs_on_page = self._parse_search_results(response.text)

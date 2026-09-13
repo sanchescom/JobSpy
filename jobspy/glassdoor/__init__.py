@@ -200,7 +200,7 @@ class Glassdoor(Scraper):
         Fetches csrf token needed for API by visiting a generic page
         """
         try:
-            res = self.session.get(f"{self.base_url}/Job/computer-science-jobs.htm")
+            res = self.session.get(f"{self.base_url.rstrip(chr(47))}/Job/computer-science-jobs.htm")
             if res.status_code == 200:
                 pattern = r'"token":\s*"([^"]+)"'
                 matches = re.findall(pattern, res.text)
@@ -318,44 +318,39 @@ class Glassdoor(Scraper):
             desc = markdown_converter(desc)
         return desc
 
+    # Glassdoor removed /findPopularLocationAjax.htm (hard 404 on every IP, including
+    # clean residential ones), so there is no autocomplete to call any more. These ids
+    # are verified against the job-search GraphQL endpoint: the returned postings carry
+    # the expected city/country. Unknown locations fall back to the country rather than
+    # failing the whole scrape, which is what returning (None, None) used to do.
+    _LOCATION_IDS = {
+        "canada": (3, "COUNTRY"),
+        "toronto": (2281069, "CITY"),
+        "vancouver": (2278756, "CITY"),
+        "victoria": (2279563, "CITY"),
+    }
+    _COUNTRY_FALLBACK = {"canada": (3, "COUNTRY")}
+
     def _get_location(self, location: str, is_remote: bool) -> (int, str):
         if not location or is_remote:
-            return "11047", "STATE"  # remote options
-        # base_url has a trailing slash — don't double it, Glassdoor's WAF 403s "//"
-        url = f"{self.base_url.rstrip('/')}/findPopularLocationAjax.htm?maxLocationsToReturn=10&term={location}"
-        # Glassdoor's WAF flags a fraction of proxy IPs (400/403). Retry with a
-        # fresh session (new IP on a rotating gateway) until one gets through.
-        items = None
-        for attempt in range(6):
-            res = self.session.get(url)
-            if res.status_code == 429:
-                log.error("429 Response - Blocked by Glassdoor for too many requests")
-                return None, None
-            if res.status_code == 200:
-                try:
-                    items = res.json()
-                    break
-                except Exception:
-                    pass  # HTML/garbage body — treat as a blocked IP, rotate
-            log.warning(
-                "Glassdoor location lookup got %s (attempt %d/6), rotating IP",
-                res.status_code, attempt + 1,
-            )
-            self.session = self._make_session()
-        if items is None:
-            log.error("Glassdoor: location lookup failed after retries")
-            return None, None
+            country = (self.scraper_input.country.value[0] if self.scraper_input else "") or ""
+            return self._COUNTRY_FALLBACK.get(country.split(",")[0].strip().lower(), ("11047", "STATE"))
 
-        if not items:
-            raise ValueError(f"Location '{location}' not found on Glassdoor")
-        location_type = items[0]["locationType"]
-        if location_type == "C":
-            location_type = "CITY"
-        elif location_type == "S":
-            location_type = "STATE"
-        elif location_type == "N":
-            location_type = "COUNTRY"
-        return int(items[0]["locationId"]), location_type
+        key = location.split(",")[0].strip().lower()
+        hit = self._LOCATION_IDS.get(key)
+        if hit:
+            return hit
+
+        country = (self.scraper_input.country.value[0] if self.scraper_input else "") or ""
+        fallback = self._COUNTRY_FALLBACK.get(country.split(",")[0].strip().lower())
+        if fallback:
+            log.warning(
+                "Glassdoor: no location id for %r, searching %s-wide instead",
+                location, country.split(",")[0].strip().title(),
+            )
+            return fallback
+        log.warning("Glassdoor: no location id for %r and no country fallback", location)
+        return "11047", "STATE"
 
     def _add_payload(
         self,

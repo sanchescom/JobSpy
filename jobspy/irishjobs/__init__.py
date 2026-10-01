@@ -8,6 +8,7 @@ from typing import Optional
 from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
+from curl_cffi import requests as cffi_requests
 
 from jobspy.model import (
     Scraper,
@@ -19,11 +20,11 @@ from jobspy.model import (
     Country,
 )
 from jobspy.util import (
-    create_session,
+    RotatingProxySession,
     extract_emails_from_text,
     markdown_converter,
 )
-from jobspy.irishjobs.constant import BASE_URL, SEARCH_URL, SELECTORS, headers
+from jobspy.irishjobs.constant import BASE_URL, SEARCH_URL, SELECTORS
 from jobspy.irishjobs.util import (
     log,
     parse_salary,
@@ -208,11 +209,18 @@ class IrishJobs(Scraper):
     # ── HTTP fallback ─────────────────────────────────────────────
 
     def _scrape_with_http(self) -> JobResponse:
-        """Primary path: fetch the SSR search page and parse it. irishjobs.ie
-        flags a fraction of proxy IPs (403/SSL), so retry with a fresh session
-        (new IP on a rotating residential gateway) until one returns 200."""
+        """Primary path: fetch the SSR search page and parse it.
+
+        irishjobs.ie sits behind Akamai Bot Manager, which 403s any client whose
+        TLS/HTTP2 fingerprint isn't a browser's (python-requests, tls_client, even
+        headless Chromium) — so impersonate Chrome via curl_cffi. It also bans
+        datacenter IPs, so this goes through the residential proxy; a fraction of
+        those IPs are flagged too, hence the retry (new connection = new IP on a
+        rotating gateway) until one returns 200."""
         job_list: list[JobPost] = []
         current_page = 1
+        proxy = self.proxies[0] if isinstance(self.proxies, list) and self.proxies else self.proxies
+        proxy_dict = RotatingProxySession.format_proxy(proxy) if proxy else None
 
         while len(job_list) < self.scraper_input.results_wanted:
             url = self._build_search_url(page=current_page)
@@ -220,12 +228,12 @@ class IrishJobs(Scraper):
 
             response = None
             for attempt in range(6):
-                session = create_session(
-                    proxies=self.proxies, ca_cert=self.ca_cert, is_tls=False, has_retry=False
-                )
-                session.headers.update(headers)  # browser UA — default requests UA is blocked
                 try:
-                    resp = session.get(url, timeout=30)
+                    # No custom headers: impersonate sends Chrome's own, and a UA
+                    # that disagrees with the TLS fingerprint gets flagged.
+                    resp = cffi_requests.get(
+                        url, impersonate="chrome", proxies=proxy_dict, timeout=30
+                    )
                     if resp.status_code == 200:
                         response = resp
                         break

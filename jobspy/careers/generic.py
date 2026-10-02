@@ -26,8 +26,17 @@ EMBEDDED_ATS_DOMAINS = {
 
 class GenericCareerParser(BaseATSParser):
     platform = "custom"
+    # Why the last fetch_jobs() found nothing, one note per strategy tried —
+    # every strategy swallows its errors and returns [], so without this a
+    # page that never yields jobs shows no reason anywhere.
+    last_reason: str | None = None
+
+    def _note(self, reason: str) -> None:
+        self._notes.append(reason)
 
     def fetch_jobs(self, career_url: str, company_name: str) -> list[JobPost]:
+        self._notes: list[str] = []
+        self.last_reason = None
         # Strategy 1-2: HTTP fetch → JSON-LD / embedded ATS detection
         jobs = self._try_http(career_url, company_name)
         if jobs:
@@ -43,7 +52,8 @@ class GenericCareerParser(BaseATSParser):
         if jobs:
             return jobs
 
-        logger.info("Generic: no jobs found at %s (needs_review)", career_url)
+        self.last_reason = "; ".join(self._notes) or "no jobs found"
+        logger.info("Generic: no jobs found at %s (%s)", career_url, self.last_reason)
         return []
 
     def _try_http(self, career_url: str, company_name: str) -> list[JobPost]:
@@ -52,11 +62,16 @@ class GenericCareerParser(BaseATSParser):
             resp = self.session.get(career_url, timeout=30)
             if not resp.ok:
                 logger.warning("Generic parser HTTP %d for %s", resp.status_code, career_url)
+                self._note(f"http {resp.status_code}")
                 return []
 
-            return self._extract_from_html(resp.text, career_url, company_name)
+            jobs = self._extract_from_html(resp.text, career_url, company_name)
+            if not jobs:
+                self._note(f"http 200 ({len(resp.text) // 1024} KB): no JSON-LD, embedded ATS or job links")
+            return jobs
         except Exception as e:
             logger.warning("Generic HTTP fetch failed for %s: %s", career_url, e)
+            self._note(f"http {type(e).__name__}")
             return []
 
     def _try_sitemap(self, career_url: str, company_name: str) -> list[JobPost]:
@@ -114,6 +129,7 @@ class GenericCareerParser(BaseATSParser):
                 break
 
         if not all_job_urls:
+            self._note("sitemap: no job URLs")
             return []
 
         # Deduplicate
@@ -184,6 +200,7 @@ class GenericCareerParser(BaseATSParser):
             logger.info("Generic (sitemap): %d jobs from %s", len(jobs), career_url)
             self._enrich_jobs(jobs)
             return jobs
+        self._note(f"sitemap: {len(jobs)} job URL(s), need 2")
         return []
 
     def _enrich_jobs(self, jobs: list[JobPost], max_fetch: int = 50) -> None:
@@ -352,6 +369,7 @@ class GenericCareerParser(BaseATSParser):
                 from playwright.sync_api import sync_playwright
             except ImportError:
                 logger.debug("No browser engine available for %s", career_url)
+                self._note("browser: no engine installed")
                 return []
 
         proxy_arg = None
@@ -409,6 +427,7 @@ class GenericCareerParser(BaseATSParser):
                     html = page.content()
                     logger.info("Generic browser: rendered %d chars, %d JSON responses from %s",
                                 len(html), len(captured_json), career_url)
+                    rendered = f"browser: rendered {len(html) // 1024} KB, {len(captured_json)} JSON responses"
 
                     # Strategy 1: JSON-LD / embedded ATS from rendered HTML
                     jobs = self._extract_from_html(html, career_url, company_name)
@@ -455,11 +474,14 @@ class GenericCareerParser(BaseATSParser):
                             self._enrich_jobs(jobs)
                             return jobs
 
+                    self._note(f"{rendered}, no jobs"
+                               + (f" (also at {jobs_url})" if jobs_url else ", no jobs link") + " — SPA or empty board?")
                     return []
                 finally:
                     browser.close()
         except Exception as e:
             logger.warning("Generic browser failed for %s: %s", career_url, e)
+            self._note(f"browser {type(e).__name__}: {str(e)[:80]}")
             return []
         finally:
             if relay:

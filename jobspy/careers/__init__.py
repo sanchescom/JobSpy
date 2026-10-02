@@ -24,6 +24,7 @@ _PARSER_FACTORIES = {
     "careers.smartrecruiters.com": _lazy_import("SmartRecruitersParser", "smartrecruiters"),
     ".bamboohr.com": _lazy_import("BambooHRParser", "bamboohr"),
     ".applytojob.com": _lazy_import("JazzHRParser", "jazzhr"),
+    ".breezy.hr": _lazy_import("BreezyParser", "breezy"),
 }
 
 # Domain → platform name for detection without instantiating
@@ -37,6 +38,7 @@ _PLATFORM_MAP = {
     "careers.smartrecruiters.com": "smartrecruiters",
     ".bamboohr.com": "bamboohr",
     ".applytojob.com": "jazzhr",
+    ".breezy.hr": "breezy",
 }
 
 

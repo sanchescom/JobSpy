@@ -24,6 +24,12 @@ EMBEDDED_ATS_DOMAINS = {
 }
 
 
+_COMPANY_SUBDOMAINS = {"jobs", "careers", "career", "www", "apply", "join", "work", "talent", "people", "hr", "recruiting", "recruitment", "en"}
+# A sitemap can list tens of thousands of postings (Robert Half: 37,959);
+# keep the newest ones — the rest never get a description anyway.
+_SITEMAP_JOB_CAP = 1000
+
+
 class GenericCareerParser(BaseATSParser):
     platform = "custom"
     # Why the last fetch_jobs() found nothing, one note per strategy tried —
@@ -100,7 +106,11 @@ class GenericCareerParser(BaseATSParser):
                         "co.il", "co.th", "com.ar", "com.co", "com.tr", "com.my"}
         hostname = parsed.hostname or ""
         parts = hostname.split(".")
-        if len(parts) > 2:
+        # Only when the career host is an obvious subdomain of the company
+        # site (jobs.acme.com → acme.com). Guessing the parent of anything
+        # else produced hosts like "vic.edu.au", "com.pk" and "sk.ca", each a
+        # DNS failure with three urllib3 retries, hundreds of times a day.
+        if len(parts) > 2 and parts[0] in _COMPANY_SUBDOMAINS:
             candidate = ".".join(parts[-2:])
             if candidate in _MULTI_TLDS:
                 # e.g. jobs.example.co.uk -> example.co.uk
@@ -131,6 +141,9 @@ class GenericCareerParser(BaseATSParser):
         if not all_job_urls:
             self._note("sitemap: no job URLs")
             return []
+        if len(all_job_urls) > _SITEMAP_JOB_CAP:
+            all_job_urls.sort(key=lambda u: u[1] or "", reverse=True)
+            all_job_urls = all_job_urls[:_SITEMAP_JOB_CAP]
 
         # Deduplicate
         seen: set[str] = set()

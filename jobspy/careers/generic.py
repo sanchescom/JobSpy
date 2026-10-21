@@ -1012,7 +1012,7 @@ _CATEGORY_EXACT = re.compile(
     r'|about|faq|students?|campus|intern(?:ship)?s?|inclusion|diversity|values'
     r'|search|results|all-jobs|open-roles|blog|stories?|news|press'
     r'|principles?|extraordinary|university|people|mission|impact'
-    r'|sustainability|contacts?|login|sign-?up|apply-?now|subscribe|newsletter'
+    r'|sustainability|contacts?|contact-us|login|sign-?up|apply-?now|subscribe|newsletter'
     r'|articles?|authors?|shares|events?|guides?|resources?|policies?|privacy'
     r'|terms|cookies?|legal|employee-stories|candidate-guidance|class-of'
     r'|profiles?|partners?|clients?|portfolio|services?|solutions?'

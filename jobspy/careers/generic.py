@@ -97,6 +97,8 @@ class GenericCareerParser(BaseATSParser):
             f"{base}/sitemap.xml",
             f"{base}/sitemap_index.xml",
         ])
+        if base.endswith(".applytojobs.ca"):
+            sitemap_urls.append(f"{base}/sitemap")  # Humi: no .xml, not in robots.txt
 
         # Also try parent domain if career URL is on a subdomain (e.g. jobs.netflix.com -> netflix.com)
         # Avoid multi-part TLDs like co.uk, com.au, edu.au etc.
@@ -182,10 +184,13 @@ class GenericCareerParser(BaseATSParser):
             )
             title = title.strip().title()
 
-            if not title or len(title) < 5:
+            # Humi's slug is the category ("operations"); the posting page's
+            # JSON-LD gives the real title in _enrich_jobs.
+            humi = ".applytojobs.ca/" in url
+            if not humi and (not title or len(title) < 5):
                 continue
             # Skip single-word slugs (likely categories)
-            if " " not in title.strip() and len(title) < 15:
+            if not humi and " " not in title.strip() and len(title) < 15:
                 continue
 
             date_posted = None
@@ -236,6 +241,9 @@ class GenericCareerParser(BaseATSParser):
                     continue
                 html = resp.text
 
+                title = self._jsonld_title(html)
+                if title:
+                    job.title = title  # the page's own title beats one guessed from the URL
                 desc = self._extract_description_from_html(html)
                 if desc:
                     job.description = desc
@@ -247,6 +255,20 @@ class GenericCareerParser(BaseATSParser):
 
         if enriched:
             logger.info("Generic: enriched %d/%d jobs with descriptions", enriched, len(to_enrich[:max_fetch]))
+
+    def _jsonld_title(self, html: str) -> str | None:
+        for match in re.finditer(
+            r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+            html, re.DOTALL | re.IGNORECASE,
+        ):
+            try:
+                data = json.loads(match.group(1).strip())
+            except json.JSONDecodeError:
+                continue
+            for jp in self._find_job_postings(data):
+                if isinstance(jp.get("title"), str) and jp["title"].strip():
+                    return jp["title"].strip()
+        return None
 
     def _extract_description_from_html(self, html: str) -> str | None:
         """Extract job description from a single job page via JSON-LD or meta tags."""
@@ -978,7 +1000,8 @@ def _find_jobs_link(page, career_url: str) -> str | None:
 # Pattern for individual job posting URLs
 _JOB_URL_PATTERN = re.compile(
     r'/(?:careers|jobs|positions|openings|vacancies|job|listing|o|role|opportunity)'
-    r'/[a-z0-9][\w-]{5,}',  # slug must be 6+ chars, start with alphanumeric
+    r'/[a-z0-9][\w-]{5,}'  # slug must be 6+ chars, start with alphanumeric
+    r'|\.applytojobs\.ca/[^/?#]+/\d+',  # Humi: /<category>/<id>
     re.IGNORECASE,
 )
 
